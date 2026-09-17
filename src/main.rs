@@ -19,6 +19,8 @@ mod logic;
 pub struct Game {
     id: String,
     ruleset: HashMap<String, Value>,
+    #[serde(default)]
+    map: Option<String>,
     timeout: u32,
 }
 
@@ -43,7 +45,7 @@ pub struct Battlesnake {
     shout: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Clone, Copy, Deserialize, Serialize, Debug, Eq, Hash, PartialEq)]
 pub struct Coord {
     x: i32,
     y: i32,

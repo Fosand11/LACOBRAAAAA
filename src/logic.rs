@@ -19,6 +19,20 @@ const DIRECTIONS: [Direction; 4] = [
     Direction::Down,
 ];
 
+const SPACE_WEIGHT: i64 = 140;
+const EXIT_WEIGHT: i64 = 90;
+const SPACE_DEFICIT_WEIGHT: i64 = 900;
+const HEALTH_WEIGHT: i64 = 3;
+const HAZARD_WEIGHT: i64 = 120;
+const FOOD_HEALTH_THRESHOLD: i32 = 45;
+const FOOD_HEALTH_WEIGHT: i64 = 95;
+const FOOD_SCORE: i64 = 350;
+const FOOD_URGENCY_HEALTH: i32 = 55;
+const FOOD_DISTANCE_WEIGHT: i64 = 25;
+const CRITICAL_HEALTH: i32 = 18;
+const STARVATION_PENALTY: i64 = 4_000;
+const NO_FOOD_PENALTY: i64 = 5_000;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct Point {
     x: i32,
@@ -72,7 +86,7 @@ impl Direction {
             }
             return Some(Point {
                 x: next.x.rem_euclid(board.width),
-                y: next.y.rem_euclid(board.height as i32),
+                y: next.y.rem_euclid(board.height),
             });
         }
 
@@ -216,8 +230,6 @@ fn evaluate_move(
             planning_blocked.remove(&tail);
         }
     }
-    planning_blocked.remove(&target);
-
     let (space, distances) = reachable_space(board, target, &planning_blocked, &dangerous, wraps);
     let exits = DIRECTIONS
         .iter()
@@ -229,29 +241,29 @@ fn evaluate_move(
 
     let projected_length = projected_body.len() as i64;
     let space_deficit = (projected_length + 2 - space as i64).max(0);
-    let mut score = space as i64 * 140 + exits * 90 + centre_score(target, board);
-    score += health_after as i64 * 3;
-    score -= hazard_cost as i64 * 120;
-    score -= space_deficit * space_deficit * 900;
+    let mut score = space as i64 * SPACE_WEIGHT + exits * EXIT_WEIGHT + centre_score(target, board);
+    score += health_after as i64 * HEALTH_WEIGHT;
+    score -= hazard_cost as i64 * HAZARD_WEIGHT;
+    score -= space_deficit * space_deficit * SPACE_DEFICIT_WEIGHT;
 
     if eating {
         // Food is mainly valuable as fuel; growing without a health need is a
         // modest cost because it reduces future manoeuvrability.
-        score += if you.health <= 45 {
-            (101 - you.health) as i64 * 95
+        score += if you.health <= FOOD_HEALTH_THRESHOLD {
+            (101 - you.health) as i64 * FOOD_HEALTH_WEIGHT
         } else {
-            350
+            FOOD_SCORE
         };
     } else if let Some(distance) = food_distance {
         let can_arrive_before_starving = constrictor || distance <= health_after;
         if can_arrive_before_starving && !food_is_contested {
-            let urgency = (55 - health_after).max(0) as i64;
-            score += urgency * 75 - distance as i64 * 25;
-        } else if health_after <= 18 {
-            score -= 4_000;
+            let urgency = (FOOD_URGENCY_HEALTH - health_after).max(0) as i64;
+            score += urgency * FOOD_HEALTH_WEIGHT - distance as i64 * FOOD_DISTANCE_WEIGHT;
+        } else if health_after <= CRITICAL_HEALTH {
+            score -= STARVATION_PENALTY;
         }
-    } else if !constrictor && health_after <= 18 {
-        score -= 5_000;
+    } else if !constrictor && health_after <= CRITICAL_HEALTH {
+        score -= NO_FOOD_PENALTY;
     }
 
     Some(Candidate {
@@ -262,7 +274,7 @@ fn evaluate_move(
 }
 
 fn in_bounds(point: Point, board: &Board) -> bool {
-    point.x >= 0 && point.x < board.width && point.y >= 0 && point.y < board.height as i32
+    point.x >= 0 && point.x < board.width && point.y >= 0 && point.y < board.height
 }
 
 fn point_set(coords: &[Coord]) -> HashSet<Point> {
@@ -387,7 +399,8 @@ fn reachable_space(
             let Some(next) = direction.next(point, board, wraps) else {
                 continue;
             };
-            if blocked.contains(&next) || dangerous.contains(&next) || distances.contains_key(&next) {
+            if blocked.contains(&next) || dangerous.contains(&next) || distances.contains_key(&next)
+            {
                 continue;
             }
             distances.insert(next, distance + 1);
@@ -408,7 +421,11 @@ fn nearest_food(
     you_id: &str,
 ) -> (Option<i32>, bool) {
     let mut closest: Option<(i32, bool)> = None;
-    for point in food.iter().copied().filter(|point| *point != current_target) {
+    for point in food
+        .iter()
+        .copied()
+        .filter(|point| *point != current_target)
+    {
         let Some(&distance) = distances.get(&point) else {
             continue;
         };
@@ -416,10 +433,14 @@ fn nearest_food(
         // current board state. Manhattan distance intentionally gives opponents
         // the benefit of the doubt and prevents optimistic food races.
         let my_turns = distance + 1;
-        let contested = board.snakes.iter().filter(|snake| snake.id != you_id).any(|snake| {
-            let opponent_turns = board_distance(Point::from(&snake.head), point, board, wraps);
-            snake_length(snake) >= my_length && opponent_turns <= my_turns
-        });
+        let contested = board
+            .snakes
+            .iter()
+            .filter(|snake| snake.id != you_id)
+            .any(|snake| {
+                let opponent_turns = board_distance(Point::from(&snake.head), point, board, wraps);
+                snake_length(snake) >= my_length && opponent_turns <= my_turns
+            });
         if closest.map_or(true, |(best, _)| distance < best) {
             closest = Some((distance, contested));
         }
@@ -433,7 +454,7 @@ fn board_distance(a: Point, b: Point, board: &Board, wraps: bool) -> i32 {
     let direct_x = (a.x - b.x).abs();
     let direct_y = (a.y - b.y).abs();
     if wraps {
-        direct_x.min(board.width - direct_x) + direct_y.min(board.height as i32 - direct_y)
+        direct_x.min(board.width - direct_x) + direct_y.min(board.height - direct_y)
     } else {
         direct_x + direct_y
     }
@@ -442,7 +463,7 @@ fn board_distance(a: Point, b: Point, board: &Board, wraps: bool) -> i32 {
 fn centre_score(point: Point, board: &Board) -> i64 {
     // Prefer the centre only as a tie-breaker; usable space dominates this.
     let horizontal = (2 * point.x - (board.width - 1)).abs();
-    let vertical = (2 * point.y - (board.height as i32 - 1)).abs();
+    let vertical = (2 * point.y - (board.height - 1)).abs();
     -(horizontal + vertical) as i64 * 8
 }
 
@@ -507,10 +528,7 @@ mod tests {
     fn game(ruleset_name: &str, map: Option<&str>) -> Game {
         let mut ruleset = HashMap::new();
         ruleset.insert("name".to_owned(), Value::String(ruleset_name.to_owned()));
-        ruleset.insert(
-            "settings".to_owned(),
-            json!({ "hazardDamagePerTurn": 14 }),
-        );
+        ruleset.insert("settings".to_owned(), json!({ "hazardDamagePerTurn": 14 }));
         Game {
             id: "test".to_owned(),
             ruleset,
@@ -521,7 +539,7 @@ mod tests {
 
     fn board(
         width: i32,
-        height: u32,
+        height: i32,
         food: &[(i32, i32)],
         hazards: &[(i32, i32)],
         snakes: Vec<Battlesnake>,
@@ -679,13 +697,7 @@ mod tests {
     #[test]
     fn response_is_always_a_valid_api_move() {
         let me = snake("me", 100, &[(2, 2), (2, 1)]);
-        let board = board(
-            5,
-            5,
-            &[],
-            &[],
-            vec![snake("me", 100, &[(2, 2), (2, 1)])],
-        );
+        let board = board(5, 5, &[], &[], vec![snake("me", 100, &[(2, 2), (2, 1)])]);
         let response = get_move(&game("standard", None), &7, &board, &me);
 
         assert!(matches!(

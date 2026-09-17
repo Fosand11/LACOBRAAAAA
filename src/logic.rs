@@ -8,6 +8,7 @@
 use log::info;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::convert::TryFrom;
 
 use crate::{Battlesnake, Board, Coord, Game};
 
@@ -211,8 +212,8 @@ fn evaluate_move(
         }
     }
     if traversable_tail {
-        if let Some(tail) = projected_body.last() {
-            planning_blocked.remove(tail);
+        if let Some(tail) = you.body.last().map(Point::from) {
+            planning_blocked.remove(&tail);
         }
     }
     planning_blocked.remove(&target);
@@ -224,7 +225,7 @@ fn evaluate_move(
         .filter(|point| !planning_blocked.contains(point) && !dangerous.contains(point))
         .count() as i64;
     let (food_distance, food_is_contested) =
-        nearest_food(board, &food, target, my_length, &distances, wraps);
+        nearest_food(board, &food, target, my_length, &distances, wraps, &you.id);
 
     let projected_length = projected_body.len() as i64;
     let space_deficit = (projected_length + 2 - space as i64).max(0);
@@ -404,6 +405,7 @@ fn nearest_food(
     my_length: i32,
     distances: &HashMap<Point, i32>,
     wraps: bool,
+    you_id: &str,
 ) -> (Option<i32>, bool) {
     let mut closest: Option<(i32, bool)> = None;
     for point in food.iter().copied().filter(|point| *point != current_target) {
@@ -414,7 +416,7 @@ fn nearest_food(
         // current board state. Manhattan distance intentionally gives opponents
         // the benefit of the doubt and prevents optimistic food races.
         let my_turns = distance + 1;
-        let contested = board.snakes.iter().any(|snake| {
+        let contested = board.snakes.iter().filter(|snake| snake.id != you_id).any(|snake| {
             let opponent_turns = board_distance(Point::from(&snake.head), point, board, wraps);
             snake_length(snake) >= my_length && opponent_turns <= my_turns
         });
@@ -644,7 +646,10 @@ mod tests {
             5,
             &[],
             &[(0, 1), (0, 3)],
-            vec![snake("me", 5, &[(0, 2), (1, 2)])],
+            vec![
+                snake("me", 5, &[(0, 2), (1, 2)]),
+                snake("enemy", 100, &[(1, 2), (1, 1)]),
+            ],
         );
 
         assert_eq!(

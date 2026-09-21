@@ -27,8 +27,33 @@ You should see the following output once it is running
 Open [localhost:8000](http://localhost:8000) in your browser and you should see
 
 ```json
-{"apiversion":"1","author":"","color":"#888888","head":"default","tail":"default"}
+{"apiversion":"1","author":"","color":"#276FBF","head":"default","tail":"default"}
 ```
+
+## Strategy and verification
+
+The snake is intentionally survival-first rather than food-first. Every move
+is screened for boundaries, bodies, health, hazards, and equal-or-larger
+head-to-head collisions. Survivable moves are then ranked by accessible space,
+territory won against rival path distances, exits, and safe food races. A
+bounded 28-turn self-simulation models tail movement, growth, hunger, and
+future enemy arrival zones, avoiding corridors that look open in a one-turn
+flood fill but close before the tail can clear them. When it is longer, the
+snake also takes only forced head-to-head eliminations: a shorter rival must
+have no other legal escape.
+
+Run the deterministic regression suite before deploying:
+
+```sh
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo test --release
+```
+
+At the default `info` level the server logs only the chosen move and a compact
+start/end summary, reducing log overhead under the game timeout. For deep
+diagnosis of a local replay, set `RUST_LOG=debug`; that enables rejected move
+and candidate-score details.
 
 ## Play a Game Locally
 

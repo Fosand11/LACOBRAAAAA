@@ -5,10 +5,11 @@
 //! when health makes it necessary. It is deterministic on purpose: that makes
 //! a bad decision reproducible from a game replay and therefore fixable.
 
-use log::info;
+use log::{debug, info, warn};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
+use std::time::Instant;
 
 use crate::{Battlesnake, Board, Coord, Game};
 
@@ -26,12 +27,24 @@ const HEALTH_WEIGHT: i64 = 3;
 const HAZARD_WEIGHT: i64 = 120;
 const FOOD_HEALTH_THRESHOLD: i32 = 45;
 const FOOD_HEALTH_WEIGHT: i64 = 95;
-const FOOD_SCORE: i64 = 350;
+const FOOD_SCORE: i64 = -250;
+const FOOD_SEEK_HEALTH: i32 = 65;
 const FOOD_URGENCY_HEALTH: i32 = 55;
 const FOOD_DISTANCE_WEIGHT: i64 = 25;
 const CRITICAL_HEALTH: i32 = 18;
 const STARVATION_PENALTY: i64 = 4_000;
 const NO_FOOD_PENALTY: i64 = 5_000;
+const SURVIVAL_HORIZON: usize = 28;
+const SURVIVAL_BEAM_WIDTH: usize = 96;
+const TERRITORY_WEIGHT: i64 = 90;
+const FORCED_KILL_BONUS: i64 = 12_000;
+const MIN_SAFE_SPACE: usize = 8;
+const MIN_SAFE_FUTURE_SURVIVAL: i64 = 4_000;
+const MIN_SAFE_EXITS: i64 = 2;
+const TRAP_SPACE_THRESHOLD: i64 = 24;
+const TRAP_PENALTY_WEIGHT: i64 = 320;
+const FOOD_RESCUE_HEALTH: i32 = 35;
+const FOOD_RESCUE_WEIGHT: i64 = 180;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct Point {
@@ -98,7 +111,45 @@ impl Direction {
 struct Candidate {
     direction: Direction,
     score: i64,
+    health_after: i32,
+    space: usize,
+    exits: i64,
+    eating: bool,
+    territory: i64,
+    forced_kill: bool,
+    future_survival: i64,
     loses_head_to_head: bool,
+}
+
+struct TerritoryAnalysis {
+    controlled: i64,
+    enemy_distances: Vec<(i32, HashMap<Point, i32>)>,
+}
+
+#[derive(Clone)]
+struct SimState {
+    body: Vec<Point>,
+    health: i32,
+    eaten_food: u128,
+}
+
+struct SurvivalContext<'a> {
+    game: &'a Game,
+    board: &'a Board,
+    you: &'a Battlesnake,
+    hazard_stacks: &'a HashMap<Point, i32>,
+    dangerous: &'a HashSet<Point>,
+    enemy_arrivals: &'a [(i32, HashMap<Point, i32>)],
+    wraps: bool,
+}
+
+struct AttackContext<'a> {
+    game: &'a Game,
+    board: &'a Board,
+    you: &'a Battlesnake,
+    projected_body: &'a [Point],
+    food: &'a HashSet<Point>,
+    wraps: bool,
 }
 
 // info is called when you create your Battlesnake on play.battlesnake.com
@@ -110,17 +161,35 @@ pub fn info() -> Value {
         "apiversion": "1",
         "author": "",
         "color": "#276FBF",
-        "head": "safe",
-        "tail": "bolt",
+        "head": "default",
+        "tail": "default",
     })
 }
 
-pub fn start(_game: &Game, _turn: &i32, _board: &Board, _you: &Battlesnake) {
-    info!("GAME START");
+pub fn start(game: &Game, turn: &i32, board: &Board, you: &Battlesnake) {
+    info!(
+        "GAME_START id={} turn={} board={}x{} snakes={} health={} length={}",
+        game.id,
+        turn,
+        board.width,
+        board.height,
+        board.snakes.len(),
+        you.health,
+        you.length
+    );
 }
 
-pub fn end(_game: &Game, _turn: &i32, _board: &Board, _you: &Battlesnake) {
-    info!("GAME OVER");
+pub fn end(game: &Game, turn: &i32, board: &Board, you: &Battlesnake) {
+    info!(
+        "GAME_END id={} turn={} head=({}, {}) health={} length={} survivors={}",
+        game.id,
+        turn,
+        you.head.x,
+        you.head.y,
+        you.health,
+        you.length,
+        board.snakes.len()
+    );
 }
 
 /// Select the highest-scoring survivable move.
@@ -138,7 +207,18 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
         // The game is already lost. Return a syntactically valid direction
         // rather than timing out or panicking; an in-bounds move is preferred
         // for useful diagnostics in the replay.
-        return DIRECTIONS
+        warn!(
+            "MOVE_NO_SAFE_CANDIDATE game_id={} ruleset={} health={} head=({}, {})",
+            game.id,
+            game.ruleset
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            you.health,
+            you.head.x,
+            you.head.y
+        );
+        let fallback = DIRECTIONS
             .iter()
             .copied()
             .find(|direction| {
@@ -147,6 +227,8 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
                     .is_some()
             })
             .unwrap_or(Direction::Up);
+        warn!("MOVE_FALLBACK direction={}", fallback.name());
+        return fallback;
     }
 
     let non_losing: Vec<&Candidate> = candidates
@@ -159,6 +241,53 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
         non_losing
     };
 
+    // Do not choose a move whose continuation search is already dead when
+    // another candidate can continue. This is stronger than a score penalty:
+    // food or territory must not beat a route with a real future.
+    let future_viable: Vec<&Candidate> = pool
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.future_survival > 0)
+        .collect();
+    let pool = if future_viable.is_empty() {
+        pool
+    } else {
+        future_viable
+    };
+
+    // Do not trade a healthy escape route for a locally attractive corridor.
+    // Keep the mobility floor as a preference, not an absolute rule: when
+    // every legal move is already dangerous, the normal score still chooses
+    // the least-bad option and the logs preserve that situation.
+    let mobility_safe: Vec<&Candidate> = pool
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate.space >= MIN_SAFE_SPACE
+                && candidate.future_survival >= MIN_SAFE_FUTURE_SURVIVAL
+                && candidate.exits >= MIN_SAFE_EXITS
+        })
+        .collect();
+    let pool = if mobility_safe.is_empty() {
+        let best_future = pool
+            .iter()
+            .map(|candidate| candidate.future_survival)
+            .max()
+            .unwrap_or(0);
+        let future_best: Vec<&Candidate> = pool
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.future_survival == best_future)
+            .collect();
+        if future_best.is_empty() {
+            pool
+        } else {
+            future_best
+        }
+    } else {
+        mobility_safe
+    };
+
     // `>` intentionally preserves DIRECTIONS' stable tie-break order.
     let mut best = pool[0];
     for candidate in pool.into_iter().skip(1) {
@@ -166,6 +295,20 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
             best = candidate;
         }
     }
+    info!(
+        "MOVE_DECISION id={} direction={} score={} health_after={} space={} territory={} exits={} eating={} forced_kill={} h2h_risk={} future={}",
+        game.id,
+        best.direction.name(),
+        best.score,
+        best.health_after,
+        best.space,
+        best.territory,
+        best.exits,
+        best.eating,
+        best.forced_kill,
+        best.loses_head_to_head,
+        best.future_survival
+    );
     best.direction
 }
 
@@ -177,7 +320,16 @@ fn evaluate_move(
 ) -> Option<Candidate> {
     let wraps = is_wrapped(game);
     let head = Point::from(&you.head);
-    let target = direction.next(head, board, wraps)?;
+    let Some(target) = direction.next(head, board, wraps) else {
+        debug!(
+            "MOVE_REJECT direction={} reason=outside_board head=({}, {}) wraps={}",
+            direction.name(),
+            head.x,
+            head.y,
+            wraps
+        );
+        return None;
+    };
     let food = point_set(&board.food);
     let eating = food.contains(&target);
     let constrictor = is_constrictor(game);
@@ -198,7 +350,26 @@ fn evaluate_move(
         you.health - 1 - hazard_cost
     };
 
-    if health_after <= 0 || collides_with_body(target, board, you, grows) {
+    if health_after <= 0 {
+        debug!(
+            "MOVE_REJECT direction={} reason=lethal_health target=({}, {}) health_after={} hazard_cost={} eating={}",
+            direction.name(),
+            target.x,
+            target.y,
+            health_after,
+            hazard_cost,
+            eating
+        );
+        return None;
+    }
+    if collides_with_body(target, board, you, grows) {
+        debug!(
+            "MOVE_REJECT direction={} reason=body_collision target=({}, {}) grows={}",
+            direction.name(),
+            target.x,
+            target.y,
+            grows
+        );
         return None;
     }
 
@@ -236,8 +407,39 @@ fn evaluate_move(
         .filter_map(|next_direction| next_direction.next(target, board, wraps))
         .filter(|point| !planning_blocked.contains(point) && !dangerous.contains(point))
         .count() as i64;
-    let (food_distance, food_is_contested) =
-        nearest_food(board, &food, target, my_length, &distances, wraps, &you.id);
+    let territory = territory_analysis(board, you, target, &projected_body, my_length, wraps);
+    let (food_distance, food_is_contested) = nearest_food(
+        &food,
+        target,
+        my_length,
+        &distances,
+        &territory.enemy_distances,
+    );
+    let survival_context = SurvivalContext {
+        game,
+        board,
+        you,
+        hazard_stacks: &hazard_stacks,
+        dangerous: &dangerous,
+        enemy_arrivals: &territory.enemy_distances,
+        wraps,
+    };
+    let future_survival = future_survival_score(
+        &survival_context,
+        &projected_body,
+        health_after,
+        target,
+        eating,
+    );
+    let attack_context = AttackContext {
+        game,
+        board,
+        you,
+        projected_body: &projected_body,
+        food: &food,
+        wraps,
+    };
+    let forced_kill = forced_kill_available(&attack_context, target, my_length);
 
     let projected_length = projected_body.len() as i64;
     let space_deficit = (projected_length + 2 - space as i64).max(0);
@@ -245,32 +447,57 @@ fn evaluate_move(
     score += health_after as i64 * HEALTH_WEIGHT;
     score -= hazard_cost as i64 * HAZARD_WEIGHT;
     score -= space_deficit * space_deficit * SPACE_DEFICIT_WEIGHT;
+    score += territory.controlled * TERRITORY_WEIGHT;
+    score += future_survival;
+    if exits < MIN_SAFE_EXITS && space < TRAP_SPACE_THRESHOLD as usize {
+        let deficit = TRAP_SPACE_THRESHOLD - space as i64;
+        score -= deficit * deficit * TRAP_PENALTY_WEIGHT;
+    }
+    if forced_kill {
+        score += FORCED_KILL_BONUS;
+    }
 
     if eating {
         // Food is mainly valuable as fuel; growing without a health need is a
         // modest cost because it reduces future manoeuvrability.
         score += if you.health <= FOOD_HEALTH_THRESHOLD {
             (101 - you.health) as i64 * FOOD_HEALTH_WEIGHT
+        } else if you.health <= FOOD_SEEK_HEALTH {
+            (FOOD_SEEK_HEALTH - you.health + 1) as i64 * FOOD_HEALTH_WEIGHT
         } else {
             FOOD_SCORE
         };
-    } else if let Some(distance) = food_distance {
-        let can_arrive_before_starving = constrictor || distance <= health_after;
-        if can_arrive_before_starving && !food_is_contested {
-            let urgency = (FOOD_URGENCY_HEALTH - health_after).max(0) as i64;
-            score += urgency * FOOD_HEALTH_WEIGHT - distance as i64 * FOOD_DISTANCE_WEIGHT;
-        } else if health_after <= CRITICAL_HEALTH {
-            score -= STARVATION_PENALTY;
+    } else if health_after <= FOOD_SEEK_HEALTH {
+        if let Some(distance) = food_distance {
+            let can_arrive_before_starving = constrictor || distance <= health_after;
+            if can_arrive_before_starving && !food_is_contested {
+                let urgency = (FOOD_URGENCY_HEALTH - health_after).max(0) as i64;
+                score += urgency * FOOD_HEALTH_WEIGHT - distance as i64 * FOOD_DISTANCE_WEIGHT;
+            } else if health_after <= FOOD_RESCUE_HEALTH && distance <= health_after {
+                score += (FOOD_RESCUE_HEALTH - health_after + 1) as i64 * FOOD_RESCUE_WEIGHT
+                    - distance as i64 * FOOD_DISTANCE_WEIGHT;
+            } else if health_after <= CRITICAL_HEALTH {
+                score -= STARVATION_PENALTY;
+            }
+        } else if !constrictor && health_after <= CRITICAL_HEALTH {
+            score -= NO_FOOD_PENALTY;
         }
-    } else if !constrictor && health_after <= CRITICAL_HEALTH {
-        score -= NO_FOOD_PENALTY;
     }
 
-    Some(Candidate {
+    let candidate = Candidate {
         direction,
         score,
+        health_after,
+        space,
+        exits,
+        eating,
+        territory: territory.controlled,
+        forced_kill,
+        future_survival,
         loses_head_to_head,
-    })
+    };
+    debug!("MOVE_CANDIDATE {:?}", candidate);
+    Some(candidate)
 }
 
 fn in_bounds(point: Point, board: &Board) -> bool {
@@ -353,7 +580,7 @@ fn can_reach_in_one_turn(snake: &Battlesnake, target: Point, board: &Board, wrap
     let neck = snake.body.get(1).map(Point::from);
     DIRECTIONS.iter().copied().any(|direction| {
         let next = direction.next(head, board, wraps);
-        next == Some(target) && neck.map_or(true, |point| point != target)
+        next == Some(target) && neck != Some(target)
     })
 }
 
@@ -372,13 +599,300 @@ fn larger_head_territory(
         let neck = snake.body.get(1).map(Point::from);
         for direction in DIRECTIONS.iter().copied() {
             if let Some(point) = direction.next(head, board, wraps) {
-                if neck.map_or(true, |neck| neck != point) {
+                if neck != Some(point) {
                     territory.insert(point);
                 }
             }
         }
     }
     territory
+}
+
+/// Partition the currently accessible board by exact path distance.
+///
+/// A normal flood fill says that every connected free cell is "our" room. In
+/// multiplayer that is false: a rival head can arrive first and turn the same
+/// cell into a losing head-to-head. This Voronoi-style pass only credits cells
+/// we reach sooner, plus ties that our longer body can win.
+fn territory_analysis(
+    board: &Board,
+    you: &Battlesnake,
+    my_target: Point,
+    projected_body: &[Point],
+    my_length: i32,
+    wraps: bool,
+) -> TerritoryAnalysis {
+    let mut blocked: HashSet<Point> = projected_body.iter().copied().collect();
+    for snake in board.snakes.iter().filter(|snake| snake.id != you.id) {
+        blocked.extend(snake.body.iter().map(Point::from));
+    }
+
+    let no_danger = HashSet::new();
+    let (_, our_distances) = reachable_space(board, my_target, &blocked, &no_danger, wraps);
+    let enemy_distances: Vec<(i32, HashMap<Point, i32>)> = board
+        .snakes
+        .iter()
+        .filter(|snake| snake.id != you.id)
+        .map(|snake| {
+            let (_, distances) =
+                reachable_space(board, Point::from(&snake.head), &blocked, &no_danger, wraps);
+            (snake_length(snake), distances)
+        })
+        .collect();
+
+    let controlled = our_distances
+        .iter()
+        .filter(|(point, our_distance)| {
+            let closest_enemy = enemy_distances
+                .iter()
+                .filter_map(|(length, distances)| {
+                    distances.get(point).map(|distance| (*length, *distance))
+                })
+                .min_by_key(|(_, distance)| *distance);
+
+            match closest_enemy {
+                None => true,
+                Some((_length, distance)) if **our_distance < distance => true,
+                Some((length, distance)) if **our_distance == distance => my_length > length,
+                Some(_) => false,
+            }
+        })
+        .count() as i64;
+
+    TerritoryAnalysis {
+        controlled,
+        enemy_distances,
+    }
+}
+
+/// Return true only for a head-to-head kill the shorter snake cannot decline.
+///
+/// This is intentionally stricter than "we are longer": attacking a shorter
+/// head with open side exits merely invites it to turn away while we sacrifice
+/// position. A forced kill is useful because it removes a rival and frees its
+/// territory without adding uncertainty to our survival plan.
+fn forced_kill_available(context: &AttackContext<'_>, my_target: Point, my_length: i32) -> bool {
+    context
+        .board
+        .snakes
+        .iter()
+        .filter(|snake| snake.id != context.you.id && snake_length(snake) < my_length)
+        .any(|snake| {
+            can_reach_in_one_turn(snake, my_target, context.board, context.wraps)
+                && opponent_escape_count(context, snake, my_target) == 0
+        })
+}
+
+fn opponent_escape_count(
+    context: &AttackContext<'_>,
+    opponent: &Battlesnake,
+    my_target: Point,
+) -> usize {
+    let head = Point::from(&opponent.head);
+    let neck = opponent.body.get(1).map(Point::from);
+
+    DIRECTIONS
+        .iter()
+        .copied()
+        .filter_map(|direction| direction.next(head, context.board, context.wraps))
+        .filter(|target| *target != my_target && neck != Some(*target))
+        .filter(|target| {
+            let grows = is_constrictor(context.game) || context.food.contains(target);
+            let own_body_end = if grows {
+                opponent.body.len()
+            } else {
+                opponent.body.len().saturating_sub(1)
+            };
+            if opponent.body[..own_body_end]
+                .iter()
+                .any(|segment| Point::from(segment) == *target)
+            {
+                return false;
+            }
+
+            if context.projected_body.contains(target) {
+                return false;
+            }
+
+            context
+                .board
+                .snakes
+                .iter()
+                .filter(|snake| snake.id != opponent.id)
+                .all(|snake| {
+                    if snake.id == context.you.id {
+                        true
+                    } else {
+                        !snake
+                            .body
+                            .iter()
+                            .any(|segment| Point::from(segment) == *target)
+                    }
+                })
+        })
+        .count()
+}
+
+/// Explore our own legal continuation after this candidate move.
+///
+/// The one-turn flood fill is deliberately optimistic about a far-away tail:
+/// it can call a distant region reachable even though the head must traverse a
+/// narrow corridor first. This bounded beam search models each tail movement
+/// and food growth, so a route that closes before the tail opens gets a low
+/// score. Rival bodies stay blocked and stronger rival head territory stays
+/// forbidden; that pessimism is intentional for a survival-first snake.
+fn future_survival_score(
+    context: &SurvivalContext<'_>,
+    projected_body: &[Point],
+    health_after: i32,
+    first_target: Point,
+    ate_first_food: bool,
+) -> i64 {
+    let constrictor = is_constrictor(context.game);
+    let fixed_opponents: HashSet<Point> = context
+        .board
+        .snakes
+        .iter()
+        .filter(|snake| snake.id != context.you.id)
+        .flat_map(|snake| snake.body.iter().map(Point::from))
+        .collect();
+    let initial_eaten = if ate_first_food {
+        food_mask(first_target, &context.board.food)
+    } else {
+        0
+    };
+    let mut frontier = vec![SimState {
+        body: projected_body.to_vec(),
+        health: health_after,
+        eaten_food: initial_eaten,
+    }];
+    let mut deepest = 0_i64;
+    let mut breadth = 0_i64;
+
+    for future_step in 0..SURVIVAL_HORIZON {
+        let mut next_frontier = Vec::new();
+        for state in &frontier {
+            let head = state.body[0];
+            for direction in DIRECTIONS.iter().copied() {
+                let Some(target) = direction.next(head, context.board, context.wraps) else {
+                    continue;
+                };
+                if fixed_opponents.contains(&target) || context.dangerous.contains(&target) {
+                    continue;
+                }
+
+                let food_bit = food_mask(target, &context.board.food);
+                let eating = food_bit != 0 && state.eaten_food & food_bit == 0;
+                let grows = constrictor || eating;
+                let next_length = state.body.len() as i32 + i32::from(grows);
+                let enemy_can_arrive =
+                    context
+                        .enemy_arrivals
+                        .iter()
+                        .any(|(enemy_length, distances)| {
+                            *enemy_length + i32::from(food_bit != 0) >= next_length
+                                && distances.get(&target).is_some_and(|enemy_turns| {
+                                    *enemy_turns <= future_step as i32 + 2
+                                })
+                        });
+                if enemy_can_arrive {
+                    continue;
+                }
+                let own_body_end = if grows {
+                    state.body.len()
+                } else {
+                    state.body.len().saturating_sub(1)
+                };
+                if state.body[..own_body_end].contains(&target) {
+                    continue;
+                }
+
+                let hazard_cost = if grows {
+                    0
+                } else {
+                    context.hazard_stacks.get(&target).copied().unwrap_or(0)
+                        * hazard_damage(context.game)
+                };
+                let next_health = if constrictor || eating {
+                    100
+                } else {
+                    state.health - 1 - hazard_cost
+                };
+                if next_health <= 0 {
+                    continue;
+                }
+
+                let mut body = Vec::with_capacity(state.body.len() + 1);
+                body.push(target);
+                body.extend(state.body.iter().copied());
+                if !grows {
+                    body.pop();
+                }
+                next_frontier.push(SimState {
+                    body,
+                    health: next_health,
+                    eaten_food: state.eaten_food | food_bit,
+                });
+            }
+        }
+
+        if next_frontier.is_empty() {
+            break;
+        }
+        deepest += 1;
+        breadth += next_frontier.len().min(SURVIVAL_BEAM_WIDTH) as i64;
+        next_frontier.sort_unstable_by(|a, b| {
+            simulation_quality(
+                b,
+                context.board,
+                &fixed_opponents,
+                context.dangerous,
+                context.wraps,
+            )
+            .cmp(&simulation_quality(
+                a,
+                context.board,
+                &fixed_opponents,
+                context.dangerous,
+                context.wraps,
+            ))
+        });
+        next_frontier.truncate(SURVIVAL_BEAM_WIDTH);
+        frontier = next_frontier;
+    }
+
+    // A deep forced tail chase can work; breadth is the secondary signal that
+    // favours positions with several exits instead of a single brittle line.
+    deepest * 700 + breadth * 4
+}
+
+fn food_mask(point: Point, food: &[Coord]) -> u128 {
+    food.iter()
+        .position(|food| Point::from(food) == point)
+        .filter(|index| *index < 128)
+        .map(|index| 1_u128 << index)
+        .unwrap_or(0)
+}
+
+fn simulation_quality(
+    state: &SimState,
+    board: &Board,
+    fixed_opponents: &HashSet<Point>,
+    dangerous: &HashSet<Point>,
+    wraps: bool,
+) -> i64 {
+    let head = state.body[0];
+    let own_body_end = state.body.len().saturating_sub(1);
+    let exits = DIRECTIONS
+        .iter()
+        .filter_map(|direction| direction.next(head, board, wraps))
+        .filter(|point| {
+            !fixed_opponents.contains(point)
+                && !dangerous.contains(point)
+                && !state.body[..own_body_end].contains(point)
+        })
+        .count() as i64;
+    exits * 100 + centre_score(head, board) + state.health as i64
 }
 
 fn reachable_space(
@@ -412,13 +926,11 @@ fn reachable_space(
 }
 
 fn nearest_food(
-    board: &Board,
     food: &HashSet<Point>,
     current_target: Point,
     my_length: i32,
     distances: &HashMap<Point, i32>,
-    wraps: bool,
-    you_id: &str,
+    enemy_distances: &[(i32, HashMap<Point, i32>)],
 ) -> (Option<i32>, bool) {
     let mut closest: Option<(i32, bool)> = None;
     for point in food
@@ -430,34 +942,22 @@ fn nearest_food(
             continue;
         };
         // Add the move already selected when comparing race times from the
-        // current board state. Manhattan distance intentionally gives opponents
-        // the benefit of the doubt and prevents optimistic food races.
+        // current board state. Both sides use real board paths rather than a
+        // Manhattan estimate, so walls and coiled bodies matter in the race.
         let my_turns = distance + 1;
-        let contested = board
-            .snakes
-            .iter()
-            .filter(|snake| snake.id != you_id)
-            .any(|snake| {
-                let opponent_turns = board_distance(Point::from(&snake.head), point, board, wraps);
-                snake_length(snake) >= my_length && opponent_turns <= my_turns
-            });
-        if closest.map_or(true, |(best, _)| distance < best) {
+        let contested = enemy_distances.iter().any(|(enemy_length, distances)| {
+            *enemy_length >= my_length
+                && distances
+                    .get(&point)
+                    .is_some_and(|enemy_turns| *enemy_turns <= my_turns)
+        });
+        if closest.is_none_or(|(best, _)| distance < best) {
             closest = Some((distance, contested));
         }
     }
     closest.map_or((None, false), |(distance, contested)| {
         (Some(distance), contested)
     })
-}
-
-fn board_distance(a: Point, b: Point, board: &Board, wraps: bool) -> i32 {
-    let direct_x = (a.x - b.x).abs();
-    let direct_y = (a.y - b.y).abs();
-    if wraps {
-        direct_x.min(board.width - direct_x) + direct_y.min(board.height - direct_y)
-    } else {
-        direct_x + direct_y
-    }
 }
 
 fn centre_score(point: Point, board: &Board) -> i64 {
@@ -497,8 +997,40 @@ fn hazard_damage(game: &Game) -> i32 {
 
 // move is called on every turn and returns the next move.
 pub fn get_move(game: &Game, turn: &i32, board: &Board, you: &Battlesnake) -> Value {
+    let started = Instant::now();
     let chosen = select_direction(game, board, you);
-    info!("MOVE {}: {}", turn, chosen.name());
+    let elapsed_ms = started.elapsed().as_millis();
+    let warning_threshold_ms = u128::from(game.timeout) * 3 / 4;
+    let target = chosen
+        .next(Point::from(&you.head), board, is_wrapped(game))
+        .map(|point| format!("({}, {})", point.x, point.y))
+        .unwrap_or_else(|| "outside-board".to_owned());
+
+    if elapsed_ms >= warning_threshold_ms {
+        warn!(
+            "MOVE_SLOW id={} turn={} head=({}, {}) direction={} target={} compute_ms={} timeout_ms={}",
+            game.id,
+            turn,
+            you.head.x,
+            you.head.y,
+            chosen.name(),
+            target,
+            elapsed_ms,
+            game.timeout
+        );
+    } else {
+        info!(
+            "MOVE id={} turn={} head=({}, {}) direction={} target={} compute_ms={} timeout_ms={}",
+            game.id,
+            turn,
+            you.head.x,
+            you.head.y,
+            chosen.name(),
+            target,
+            elapsed_ms,
+            game.timeout
+        );
+    }
     json!({ "move": chosen.name() })
 }
 
@@ -582,6 +1114,40 @@ mod tests {
         );
 
         assert_ne!(
+            select_direction(&game("standard", None), &board, &me),
+            Direction::Right
+        );
+    }
+
+    #[test]
+    fn avoids_a_single_exit_trap_when_open_space_exists() {
+        let me = snake("me", 90, &[(2, 2), (2, 1), (1, 1), (1, 2)]);
+        let board = board(
+            7,
+            7,
+            &[],
+            &[],
+            vec![snake("me", 90, &[(2, 2), (2, 1), (1, 1), (1, 2)])],
+        );
+
+        assert_ne!(
+            select_direction(&game("standard", None), &board, &me),
+            Direction::Down
+        );
+    }
+
+    #[test]
+    fn rescues_low_health_with_reachable_food() {
+        let me = snake("me", 20, &[(2, 2), (2, 1)]);
+        let board = board(
+            7,
+            7,
+            &[(3, 2)],
+            &[],
+            vec![snake("me", 20, &[(2, 2), (2, 1)])],
+        );
+
+        assert_eq!(
             select_direction(&game("standard", None), &board, &me),
             Direction::Right
         );
@@ -695,6 +1261,204 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_projected_tail_available_for_space_estimation() {
+        let me = snake("me", 100, &[(2, 2), (2, 1), (2, 0)]);
+        let target = Point { x: 3, y: 2 };
+        let projected = projected_body(&me, target, false);
+        let (mut blocked, tail_moves) = blocked_after_move(
+            &board(
+                5,
+                5,
+                &[],
+                &[],
+                vec![snake("me", 100, &[(2, 2), (2, 1), (2, 0)])],
+            ),
+            &me,
+            &projected,
+            false,
+        );
+
+        assert!(tail_moves);
+        let projected_tail = *projected.last().expect("a snake has a tail");
+        blocked.remove(&projected_tail);
+        assert!(!blocked.contains(&projected_tail));
+    }
+
+    #[test]
+    fn never_marks_our_own_food_route_as_an_enemy_race() {
+        let me = snake("me", 100, &[(2, 2), (2, 1)]);
+        let board = board(
+            7,
+            7,
+            &[(4, 2)],
+            &[],
+            vec![snake("me", 100, &[(2, 2), (2, 1)])],
+        );
+        let food = point_set(&board.food);
+        let mut distances = HashMap::new();
+        distances.insert(Point { x: 4, y: 2 }, 1);
+
+        let (distance, contested) = nearest_food(
+            &food,
+            Point { x: 3, y: 2 },
+            snake_length(&me),
+            &distances,
+            &[],
+        );
+
+        assert_eq!(distance, Some(1));
+        assert!(!contested);
+    }
+
+    #[test]
+    fn rejects_food_when_an_equal_enemy_has_the_same_real_path_length() {
+        let food = HashSet::from([Point { x: 4, y: 2 }]);
+        let mut our_distances = HashMap::new();
+        our_distances.insert(Point { x: 4, y: 2 }, 1);
+        let mut enemy_path = HashMap::new();
+        enemy_path.insert(Point { x: 4, y: 2 }, 2);
+
+        let (distance, contested) = nearest_food(
+            &food,
+            Point { x: 3, y: 2 },
+            4,
+            &our_distances,
+            &[(4, enemy_path)],
+        );
+
+        assert_eq!(distance, Some(1));
+        assert!(contested);
+    }
+
+    #[test]
+    fn regression_from_log_does_not_repeat_into_the_left_wall() {
+        let me = snake(
+            "me",
+            99,
+            &[
+                (0, 10),
+                (1, 10),
+                (1, 9),
+                (2, 9),
+                (2, 8),
+                (2, 7),
+                (2, 6),
+                (1, 6),
+                (0, 6),
+            ],
+        );
+        let enemy = snake(
+            "enemy",
+            98,
+            &[
+                (7, 1),
+                (7, 0),
+                (6, 0),
+                (6, 1),
+                (6, 2),
+                (6, 3),
+                (5, 3),
+                (4, 3),
+            ],
+        );
+        let board = board(
+            11,
+            11,
+            &[(10, 7), (10, 0), (0, 8), (5, 0), (3, 1), (0, 7)],
+            &[],
+            vec![
+                snake(
+                    "me",
+                    99,
+                    &[
+                        (0, 10),
+                        (1, 10),
+                        (1, 9),
+                        (2, 9),
+                        (2, 8),
+                        (2, 7),
+                        (2, 6),
+                        (1, 6),
+                        (0, 6),
+                    ],
+                ),
+                enemy,
+            ],
+        );
+
+        assert_eq!(
+            select_direction(&game("standard", None), &board, &me),
+            Direction::Down
+        );
+    }
+
+    #[test]
+    fn takes_a_forced_head_to_head_kill_when_we_are_longer() {
+        let me = snake("me", 100, &[(1, 2), (1, 1), (1, 0), (0, 0)]);
+        let enemy = snake("enemy", 100, &[(3, 2), (3, 1), (3, 0)]);
+        let board = board(
+            5,
+            3,
+            &[],
+            &[],
+            vec![
+                snake("me", 100, &[(1, 2), (1, 1), (1, 0), (0, 0)]),
+                enemy,
+                snake("wall", 100, &[(4, 2)]),
+            ],
+        );
+        let target = Point { x: 2, y: 2 };
+        let projected = projected_body(&me, target, false);
+        let game = game("standard", None);
+        let food = point_set(&board.food);
+        let context = AttackContext {
+            game: &game,
+            board: &board,
+            you: &me,
+            projected_body: &projected,
+            food: &food,
+            wraps: false,
+        };
+
+        assert!(forced_kill_available(&context, target, snake_length(&me)));
+    }
+
+    #[test]
+    fn temporal_search_detects_food_that_closes_a_pocket() {
+        let me = snake("me", 100, &[(2, 2), (2, 1), (2, 0)]);
+        let board = board(
+            6,
+            6,
+            &[(3, 2)],
+            &[],
+            vec![
+                snake("me", 100, &[(2, 2), (2, 1), (2, 0)]),
+                snake("right", 100, &[(4, 2)]),
+                snake("up", 100, &[(3, 3)]),
+                snake("down", 100, &[(3, 1)]),
+            ],
+        );
+        let target = Point { x: 3, y: 2 };
+        let projected = projected_body(&me, target, true);
+        let hazards = hazard_counts(&board.hazards);
+        let dangerous = larger_head_territory(&board, &me, 4, false);
+        let context = SurvivalContext {
+            game: &game("standard", None),
+            board: &board,
+            you: &me,
+            hazard_stacks: &hazards,
+            dangerous: &dangerous,
+            enemy_arrivals: &[],
+            wraps: false,
+        };
+
+        assert_eq!(
+            future_survival_score(&context, &projected, 100, target, true),
+            0
+        );
+    }
+
+    #[test]
     fn response_is_always_a_valid_api_move() {
         let me = snake("me", 100, &[(2, 2), (2, 1)]);
         let board = board(5, 5, &[], &[], vec![snake("me", 100, &[(2, 2), (2, 1)])]);
@@ -704,5 +1468,84 @@ mod tests {
             response["move"].as_str(),
             Some("up" | "down" | "left" | "right")
         ));
+    }
+
+    #[test]
+    fn historical_turn_180_keeps_the_safe_tail_chase() {
+        let me = snake(
+            "me",
+            96,
+            &[
+                (6, 0),
+                (7, 0),
+                (8, 0),
+                (9, 0),
+                (10, 0),
+                (10, 1),
+                (10, 2),
+                (10, 3),
+                (10, 4),
+                (10, 5),
+                (10, 6),
+                (10, 7),
+                (10, 8),
+                (9, 8),
+                (9, 7),
+                (9, 6),
+                (9, 5),
+                (9, 4),
+                (9, 3),
+                (9, 2),
+                (9, 1),
+                (8, 1),
+                (7, 1),
+                (6, 1),
+            ],
+        );
+        let enemy = snake("enemy", 16, &[(6, 8), (6, 9), (5, 9), (5, 10)]);
+        let board = board(
+            11,
+            11,
+            &[(0, 0), (2, 1), (0, 9), (1, 7)],
+            &[],
+            vec![
+                snake(
+                    "me",
+                    96,
+                    &[
+                        (6, 0),
+                        (7, 0),
+                        (8, 0),
+                        (9, 0),
+                        (10, 0),
+                        (10, 1),
+                        (10, 2),
+                        (10, 3),
+                        (10, 4),
+                        (10, 5),
+                        (10, 6),
+                        (10, 7),
+                        (10, 8),
+                        (9, 8),
+                        (9, 7),
+                        (9, 6),
+                        (9, 5),
+                        (9, 4),
+                        (9, 3),
+                        (9, 2),
+                        (9, 1),
+                        (8, 1),
+                        (7, 1),
+                        (6, 1),
+                    ],
+                ),
+                enemy,
+            ],
+        );
+
+        assert_eq!(
+            select_direction(&game("standard", None), &board, &me),
+            Direction::Up
+        );
     }
 }

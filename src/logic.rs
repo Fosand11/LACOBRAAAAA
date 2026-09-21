@@ -1,9 +1,9 @@
-//! A deliberately conservative Battlesnake policy.
+//! A survival-first Battlesnake with local geometry and lightweight adversarial search.
 //!
-//! The priority order is: avoid a certain death this turn, avoid squares an
-//! equal-or-larger head can reach, preserve manoeuvring room, then seek food
-//! when health makes it necessary. It is deterministic on purpose: that makes
-//! a bad decision reproducible from a game replay and therefore fixable.
+//! The priority order is: avoid certain death, avoid losing head-to-heads, avoid
+//! traps, preserve future manoeuvring room, account for enemy pressure, then use
+//! territory and food to improve the position. The strategic search is bounded
+//! and deterministic so bad decisions remain reproducible from replays.
 
 use log::{debug, info, warn};
 use serde_json::{json, Value};
@@ -34,8 +34,8 @@ const FOOD_DISTANCE_WEIGHT: i64 = 25;
 const CRITICAL_HEALTH: i32 = 18;
 const STARVATION_PENALTY: i64 = 4_000;
 const NO_FOOD_PENALTY: i64 = 5_000;
-const SURVIVAL_HORIZON: usize = 28;
-const SURVIVAL_BEAM_WIDTH: usize = 96;
+const SURVIVAL_HORIZON: usize = 20;
+const SURVIVAL_BEAM_WIDTH: usize = 64;
 const TERRITORY_WEIGHT: i64 = 90;
 const FORCED_KILL_BONUS: i64 = 12_000;
 const MIN_SAFE_SPACE: usize = 8;
@@ -43,6 +43,19 @@ const MIN_SAFE_FUTURE_SURVIVAL: i64 = 4_000;
 const MIN_SAFE_EXITS: i64 = 2;
 const TRAP_SPACE_THRESHOLD: i64 = 24;
 const TRAP_PENALTY_WEIGHT: i64 = 320;
+
+// V2 strategic weights. These sit below the hard survival filters.
+const TRAP_RISK_WEIGHT: i64 = 12;
+const ENEMY_PRESSURE_WEIGHT: i64 = 5;
+const ADVERSARIAL_SPACE_WEIGHT: i64 = 0;
+const ADVERSARIAL_COLLAPSE_WEIGHT: i64 = 700;
+const FUTURE_SPACE_WEIGHT: i64 = 14;
+const MIN_ADVERSARIAL_SPACE: usize = 10;
+const PRESSURE_DISTANCE: i32 = 5;
+const TRAP_LOOKAHEAD: i32 = 6;
+const MIN_PREFERRED_EXITS: i64 = 3;
+const MIN_PREFERRED_FUTURE_SPACE: i64 = 100;
+
 const FOOD_RESCUE_HEALTH: i32 = 35;
 const FOOD_RESCUE_WEIGHT: i64 = 180;
 
@@ -118,6 +131,10 @@ struct Candidate {
     territory: i64,
     forced_kill: bool,
     future_survival: i64,
+    trap_risk: i64,
+    enemy_pressure: i64,
+    adversarial_space: usize,
+    future_space: i64,
     loses_head_to_head: bool,
 }
 
@@ -288,6 +305,24 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
         mobility_safe
     };
 
+    // Prefer genuinely open positions when one exists. This prevents the
+    // snake from repeatedly choosing 2-exit edge/corridor moves merely because
+    // their current territory score is slightly higher. If no such move exists,
+    // fall back to the normal pool.
+    let open_positions: Vec<&Candidate> = pool
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate.exits >= MIN_PREFERRED_EXITS
+                && candidate.future_space >= MIN_PREFERRED_FUTURE_SPACE
+        })
+        .collect();
+    let pool = if open_positions.is_empty() {
+        pool
+    } else {
+        open_positions
+    };
+
     // `>` intentionally preserves DIRECTIONS' stable tie-break order.
     let mut best = pool[0];
     for candidate in pool.into_iter().skip(1) {
@@ -296,7 +331,7 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
         }
     }
     info!(
-        "MOVE_DECISION id={} direction={} score={} health_after={} space={} territory={} exits={} eating={} forced_kill={} h2h_risk={} future={}",
+        "MOVE_DECISION id={} direction={} score={} health_after={} space={} territory={} exits={} eating={} forced_kill={} h2h_risk={} future={} trap={} pressure={} adversarial_space={} future_space={}",
         game.id,
         best.direction.name(),
         best.score,
@@ -307,7 +342,11 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
         best.eating,
         best.forced_kill,
         best.loses_head_to_head,
-        best.future_survival
+        best.future_survival,
+        best.trap_risk,
+        best.enemy_pressure,
+        best.adversarial_space,
+        best.future_space
     );
     best.direction
 }
@@ -431,6 +470,40 @@ fn evaluate_move(
         target,
         eating,
     );
+
+    // A move can have plenty of space now while putting us inside a corridor
+    // that collapses a few turns later.
+    let trap_risk = trap_risk_score(
+        board,
+        target,
+        &planning_blocked,
+        &dangerous,
+        wraps,
+        projected_body.len(),
+    );
+
+    let enemy_pressure = enemy_pressure_score(
+        board,
+        you,
+        target,
+        wraps,
+    );
+
+    // V2.1: keep the diagnostic field, but do not run the expensive and
+    // still-imperfect adversarial approximation. A real enemy simulation
+    // belongs in the next search layer; meanwhile the current reachable
+    // space is the safe baseline.
+    let adversarial_space = space;
+
+    let future_space = future_space_score(
+        board,
+        target,
+        &planning_blocked,
+        &dangerous,
+        wraps,
+        projected_body.len(),
+    );
+
     let attack_context = AttackContext {
         game,
         board,
@@ -449,6 +522,17 @@ fn evaluate_move(
     score -= space_deficit * space_deficit * SPACE_DEFICIT_WEIGHT;
     score += territory.controlled * TERRITORY_WEIGHT;
     score += future_survival;
+
+    score -= trap_risk * TRAP_RISK_WEIGHT;
+    score -= enemy_pressure * ENEMY_PRESSURE_WEIGHT;
+    score += adversarial_space as i64 * ADVERSARIAL_SPACE_WEIGHT;
+    score += future_space * FUTURE_SPACE_WEIGHT;
+
+    if adversarial_space < MIN_ADVERSARIAL_SPACE {
+        let deficit = (MIN_ADVERSARIAL_SPACE - adversarial_space) as i64;
+        score -= deficit * deficit * ADVERSARIAL_COLLAPSE_WEIGHT;
+    }
+
     if exits < MIN_SAFE_EXITS && space < TRAP_SPACE_THRESHOLD as usize {
         let deficit = TRAP_SPACE_THRESHOLD - space as i64;
         score -= deficit * deficit * TRAP_PENALTY_WEIGHT;
@@ -494,6 +578,10 @@ fn evaluate_move(
         territory: territory.controlled,
         forced_kill,
         future_survival,
+        trap_risk,
+        enemy_pressure,
+        adversarial_space,
+        future_space,
         loses_head_to_head,
     };
     debug!("MOVE_CANDIDATE {:?}", candidate);
@@ -923,6 +1011,243 @@ fn reachable_space(
     }
 
     (distances.len(), distances)
+}
+
+
+/// Detect corridor/trap geometry close to the head.
+///
+/// Total reachable space alone can be misleading: a large area may only be
+/// reachable through a one-cell corridor. This metric therefore looks at
+/// immediate exits, available room relative to body length, and narrow cells
+/// in the first few BFS layers.
+fn trap_risk_score(
+    board: &Board,
+    start: Point,
+    blocked: &HashSet<Point>,
+    dangerous: &HashSet<Point>,
+    wraps: bool,
+    body_len: usize,
+) -> i64 {
+    let (space, distances) = reachable_space(board, start, blocked, dangerous, wraps);
+
+    let immediate_exits = DIRECTIONS
+        .iter()
+        .filter_map(|direction| direction.next(start, board, wraps))
+        .filter(|point| !blocked.contains(point) && !dangerous.contains(point))
+        .count();
+
+    let mut risk = match immediate_exits {
+        0 => 5_000,
+        1 => 2_000,
+        2 => 250,
+        _ => 0,
+    };
+
+    let minimum_space = body_len.saturating_add(4);
+    if space < minimum_space {
+        risk += (minimum_space - space) as i64 * 350;
+    }
+
+    let mut narrow = 0_i64;
+
+    for (point, distance) in &distances {
+        if *distance > TRAP_LOOKAHEAD {
+            continue;
+        }
+
+        let exits = DIRECTIONS
+            .iter()
+            .filter_map(|direction| direction.next(*point, board, wraps))
+            .filter(|next| !blocked.contains(next) && !dangerous.contains(next))
+            .count();
+
+        if exits <= 1 {
+            narrow += 1;
+        }
+    }
+
+    risk + narrow.min(20) * 120
+}
+
+/// Estimate how quickly enemy heads can reach the area we are moving into.
+fn enemy_pressure_score(
+    board: &Board,
+    you: &Battlesnake,
+    target: Point,
+    wraps: bool,
+) -> i64 {
+    let mut pressure = 0_i64;
+
+    for enemy in &board.snakes {
+        if enemy.id == you.id {
+            continue;
+        }
+
+        let head = Point::from(&enemy.head);
+        let neck = enemy.body.get(1).map(Point::from);
+
+        let mut blocked = HashSet::new();
+
+        // Block the enemy's own body except its head, plus every other snake.
+        // This makes the BFS represent actual paths the enemy head can take.
+        blocked.extend(enemy.body.iter().skip(1).map(Point::from));
+
+        for snake in &board.snakes {
+            if snake.id != enemy.id {
+                blocked.extend(snake.body.iter().map(Point::from));
+            }
+        }
+
+        if let Some(neck) = neck {
+            blocked.remove(&neck);
+        }
+
+        let (_, distances) = reachable_space(board, head, &blocked, &HashSet::new(), wraps);
+
+        let Some(&distance) = distances.get(&target) else {
+            continue;
+        };
+
+        if distance <= PRESSURE_DISTANCE {
+            let proximity = (PRESSURE_DISTANCE - distance + 1) as i64;
+            let size_factor = if snake_length(enemy) >= snake_length(you) {
+                3
+            } else {
+                1
+            };
+
+            pressure += proximity * proximity * size_factor;
+        }
+    }
+
+    pressure
+}
+
+/// Assume each opponent chooses its legal head move that minimizes our
+/// reachable space. This is a bounded one-ply adversarial search rather than
+/// a full minimax tree, so it stays cheap enough for Battlesnake's move budget.
+fn worst_case_enemy_space(
+    game: &Game,
+    board: &Board,
+    you: &Battlesnake,
+    our_target: Point,
+    our_projected_body: &[Point],
+    base_blocked: &HashSet<Point>,
+    dangerous: &HashSet<Point>,
+    wraps: bool,
+) -> usize {
+    let mut worst = usize::MAX;
+    let constrictor = is_constrictor(game);
+    let food = point_set(&board.food);
+
+    for enemy in board.snakes.iter().filter(|snake| snake.id != you.id) {
+        let enemy_head = Point::from(&enemy.head);
+        let enemy_neck = enemy.body.get(1).map(Point::from);
+        let mut enemy_moves = Vec::new();
+
+        for direction in DIRECTIONS.iter().copied() {
+            let Some(enemy_target) = direction.next(enemy_head, board, wraps) else {
+                continue;
+            };
+
+            if enemy_neck == Some(enemy_target) {
+                continue;
+            }
+
+            let occupied_by_other = board.snakes.iter().any(|snake| {
+                snake.id != enemy.id
+                    && snake
+                        .body
+                        .iter()
+                        .any(|segment| Point::from(segment) == enemy_target)
+            });
+
+            if occupied_by_other || our_projected_body.contains(&enemy_target) {
+                continue;
+            }
+
+            let grows = constrictor || food.contains(&enemy_target);
+            let mut projected_enemy = Vec::with_capacity(enemy.body.len() + 1);
+            projected_enemy.push(enemy_target);
+            projected_enemy.extend(enemy.body.iter().map(Point::from));
+
+            if !grows {
+                projected_enemy.pop();
+            }
+
+            enemy_moves.push(projected_enemy);
+        }
+
+        if enemy_moves.is_empty() {
+            continue;
+        }
+
+        let mut enemy_worst = usize::MAX;
+
+        for projected_enemy in enemy_moves {
+            let mut blocked = base_blocked.clone();
+
+            for segment in &enemy.body {
+                blocked.remove(&Point::from(segment));
+            }
+
+            blocked.remove(&our_target);
+            blocked.extend(projected_enemy.iter().copied());
+            blocked.extend(our_projected_body.iter().copied());
+
+            let (space, _) =
+                reachable_space(board, our_target, &blocked, dangerous, wraps);
+
+            enemy_worst = enemy_worst.min(space);
+        }
+
+        worst = worst.min(enemy_worst);
+    }
+
+    if worst == usize::MAX {
+        reachable_space(board, our_target, base_blocked, dangerous, wraps).0
+    } else {
+        worst
+    }
+}
+
+/// Score the first few BFS layers so a wide room beats a long narrow tunnel.
+fn future_space_score(
+    board: &Board,
+    start: Point,
+    blocked: &HashSet<Point>,
+    dangerous: &HashSet<Point>,
+    wraps: bool,
+    body_len: usize,
+) -> i64 {
+    let (_, distances) = reachable_space(board, start, blocked, dangerous, wraps);
+
+    let mut score = 0_i64;
+    let mut previous_frontier = 1_i64;
+
+    for depth in 1..=6_i32 {
+        let frontier = distances
+            .values()
+            .filter(|distance| **distance == depth)
+            .count() as i64;
+
+        if frontier == 0 {
+            if depth <= 3 && body_len > depth as usize + 2 {
+                score -= (7 - depth) as i64 * 120;
+            }
+            break;
+        }
+
+        score += frontier * depth as i64;
+
+        if depth > 1 && frontier * 2 < previous_frontier {
+            score -= (previous_frontier - frontier) * 80;
+        }
+
+        previous_frontier = frontier;
+    }
+
+    score
 }
 
 fn nearest_food(

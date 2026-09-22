@@ -56,6 +56,19 @@ const TRAP_LOOKAHEAD: i32 = 6;
 const MIN_PREFERRED_EXITS: i64 = 3;
 const MIN_PREFERRED_FUTURE_SPACE: i64 = 100;
 
+// V2.2 anti-corner / anti-push analysis. These values are intentionally
+// strong: losing our last escape route is much worse than giving up some
+// territory or a nearby food pickup.
+const WORST_CASE_SPACE_WEIGHT: i64 = 28;
+const WORST_CASE_EXIT_WEIGHT: i64 = 1_150;
+const ESCAPE_ROUTE_WEIGHT: i64 = 240;
+const ENEMY_CUTOFF_WEIGHT: i64 = 18;
+const ENEMY_PUSH_WEIGHT: i64 = 14;
+const EDGE_EXPOSURE_WEIGHT: i64 = 11;
+const MIN_ADVERSARIAL_EXITS: i64 = 2;
+const MAX_PREFERRED_CUTOFF_RISK: i64 = 1_500;
+const PUSH_DISTANCE_THRESHOLD: i64 = 8;
+
 const FOOD_RESCUE_HEALTH: i32 = 35;
 const FOOD_RESCUE_WEIGHT: i64 = 180;
 
@@ -323,6 +336,24 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
         open_positions
     };
 
+    // V2.2: do not let a move that the enemy can collapse to one exit beat a
+    // move that preserves at least two escape routes. This is the key
+    // anti-corner rule for opponents that deliberately push from one side.
+    let anti_collapse: Vec<&Candidate> = pool
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate.forced_kill
+                || (candidate.worst_case_exits >= MIN_ADVERSARIAL_EXITS
+                    && candidate.enemy_cutoff_risk <= MAX_PREFERRED_CUTOFF_RISK)
+        })
+        .collect();
+    let pool = if anti_collapse.is_empty() {
+        pool
+    } else {
+        anti_collapse
+    };
+
     // `>` intentionally preserves DIRECTIONS' stable tie-break order.
     let mut best = pool[0];
     for candidate in pool.into_iter().skip(1) {
@@ -331,7 +362,7 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
         }
     }
     info!(
-        "MOVE_DECISION id={} direction={} score={} health_after={} space={} territory={} exits={} eating={} forced_kill={} h2h_risk={} future={} trap={} pressure={} adversarial_space={} future_space={}",
+        "MOVE_DECISION id={} direction={} score={} health_after={} space={} territory={} exits={} eating={} forced_kill={} h2h_risk={} future={} trap={} pressure={} adversarial_space={} future_space={} worst_space={} worst_exits={} escape_routes={} cutoff={} push={} edge_risk={}",
         game.id,
         best.direction.name(),
         best.score,
@@ -346,7 +377,13 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
         best.trap_risk,
         best.enemy_pressure,
         best.adversarial_space,
-        best.future_space
+        best.future_space,
+        best.worst_case_space,
+        best.worst_case_exits,
+        best.escape_routes,
+        best.enemy_cutoff_risk,
+        best.enemy_push_risk,
+        best.edge_exposure_risk
     );
     best.direction
 }
@@ -489,11 +526,22 @@ fn evaluate_move(
         wraps,
     );
 
-    // V2.1: keep the diagnostic field, but do not run the expensive and
-    // still-imperfect adversarial approximation. A real enemy simulation
-    // belongs in the next search layer; meanwhile the current reachable
-    // space is the safe baseline.
-    let adversarial_space = space;
+    // V2.2: simulate one plausible response from each enemy and measure how
+    // much of our mobility remains. This is the missing layer for enemies that
+    // intentionally push us toward a wall/corner.
+    let adversarial = adversarial_escape_analysis(
+        game,
+        board,
+        you,
+        target,
+        &projected_body,
+        &dangerous,
+        &hazard_stacks,
+        wraps,
+        exits,
+        space,
+    );
+    let adversarial_space = adversarial.worst_case_space;
 
     let future_space = future_space_score(
         board,
@@ -527,6 +575,15 @@ fn evaluate_move(
     score -= enemy_pressure * ENEMY_PRESSURE_WEIGHT;
     score += adversarial_space as i64 * ADVERSARIAL_SPACE_WEIGHT;
     score += future_space * FUTURE_SPACE_WEIGHT;
+
+    // V2.2 anti-corner scoring. A move is only truly good if it keeps an
+    // escape after the opponent gets the next move.
+    score += adversarial.worst_case_space as i64 * WORST_CASE_SPACE_WEIGHT;
+    score += adversarial.worst_case_exits * WORST_CASE_EXIT_WEIGHT;
+    score += adversarial.escape_routes * ESCAPE_ROUTE_WEIGHT;
+    score -= adversarial.enemy_cutoff_risk * ENEMY_CUTOFF_WEIGHT;
+    score -= adversarial.enemy_push_risk * ENEMY_PUSH_WEIGHT;
+    score -= adversarial.edge_exposure_risk * EDGE_EXPOSURE_WEIGHT;
 
     if adversarial_space < MIN_ADVERSARIAL_SPACE {
         let deficit = (MIN_ADVERSARIAL_SPACE - adversarial_space) as i64;
@@ -582,6 +639,12 @@ fn evaluate_move(
         enemy_pressure,
         adversarial_space,
         future_space,
+        worst_case_space: adversarial.worst_case_space,
+        worst_case_exits: adversarial.worst_case_exits,
+        escape_routes: adversarial.escape_routes,
+        enemy_cutoff_risk: adversarial.enemy_cutoff_risk,
+        enemy_push_risk: adversarial.enemy_push_risk,
+        edge_exposure_risk: adversarial.edge_exposure_risk,
         loses_head_to_head,
     };
     debug!("MOVE_CANDIDATE {:?}", candidate);
@@ -1121,6 +1184,370 @@ fn enemy_pressure_score(
     }
 
     pressure
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdversarialAnalysis {
+    worst_case_space: usize,
+    worst_case_exits: i64,
+    escape_routes: i64,
+    enemy_cutoff_risk: i64,
+    enemy_push_risk: i64,
+    edge_exposure_risk: i64,
+}
+
+/// Look one move ahead for the opponents and ask a deliberately adversarial
+/// question: "after I move here, what can the opponent do that most reduces
+/// my escape routes?"
+///
+/// This is not a full minimax. Each enemy is examined independently with its
+/// legal one-step responses. That keeps the cost small on tournament boards
+/// while still detecting the exact failure mode we saw in replays: plenty of
+/// global space, but the enemy can take away the only useful exit and push us
+/// into the boundary.
+fn adversarial_escape_analysis(
+    game: &Game,
+    board: &Board,
+    you: &Battlesnake,
+    target: Point,
+    projected_body: &[Point],
+    dangerous: &HashSet<Point>,
+    hazard_stacks: &HashMap<Point, i32>,
+    wraps: bool,
+    base_exits: i64,
+    base_space: usize,
+) -> AdversarialAnalysis {
+    let mut worst_space = base_space;
+    let mut worst_exits = base_exits;
+    let mut worst_escape_routes = base_exits;
+    let mut cutoff_risk = 0_i64;
+    let mut push_risk = 0_i64;
+
+    for enemy in board.snakes.iter().filter(|snake| snake.id != you.id) {
+        let enemy_moves = legal_enemy_projection(
+            game,
+            board,
+            you,
+            enemy,
+            target,
+            projected_body,
+            hazard_stacks,
+            wraps,
+        );
+
+        if enemy_moves.is_empty() {
+            continue;
+        }
+
+        let mut enemy_worst_space = usize::MAX;
+        let mut enemy_worst_exits = i64::MAX;
+        let mut enemy_worst_escape_routes = i64::MAX;
+        let mut enemy_best_push_risk = 0_i64;
+
+        for projected_enemy in enemy_moves {
+            let mut blocked = HashSet::new();
+            blocked.extend(projected_body.iter().copied());
+
+            for snake in board.snakes.iter().filter(|snake| snake.id != you.id) {
+                if snake.id == enemy.id {
+                    continue;
+                }
+                blocked.extend(snake.body.iter().map(Point::from));
+            }
+            blocked.extend(projected_enemy.iter().copied());
+
+            // On our next move our tail normally vacates. Keep that optimistic
+            // tail access unless we are in Constrictor, where the tail is fixed.
+            if !is_constrictor(game) {
+                if let Some(tail) = projected_body.last().copied() {
+                    blocked.remove(&tail);
+                }
+            }
+
+            let exits = count_escape_exits(
+                board,
+                target,
+                &blocked,
+                dangerous,
+                wraps,
+            ) as i64;
+            let escape_routes = escape_routes_away_from_enemies(
+                board,
+                target,
+                &blocked,
+                dangerous,
+                projected_enemy[0],
+                wraps,
+            ) as i64;
+            let (space, _) = reachable_space(board, target, &blocked, dangerous, wraps);
+            let push = enemy_push_risk(
+                board,
+                target,
+                &blocked,
+                dangerous,
+                projected_enemy[0],
+                exits,
+                escape_routes,
+                wraps,
+            );
+
+            enemy_worst_space = enemy_worst_space.min(space);
+            enemy_worst_exits = enemy_worst_exits.min(exits);
+            enemy_worst_escape_routes = enemy_worst_escape_routes.min(escape_routes);
+            enemy_best_push_risk = enemy_best_push_risk.max(push);
+        }
+
+        if enemy_worst_space != usize::MAX {
+            worst_space = worst_space.min(enemy_worst_space);
+            worst_exits = worst_exits.min(enemy_worst_exits);
+            worst_escape_routes = worst_escape_routes.min(enemy_worst_escape_routes);
+
+            let exit_loss = (base_exits - enemy_worst_exits).max(0);
+            let forced_one_exit = if enemy_worst_exits <= 1 { 1 } else { 0 };
+            cutoff_risk = cutoff_risk.max(
+                exit_loss * 550
+                    + forced_one_exit * 2_500
+                    + ((base_space as i64 - enemy_worst_space as i64).max(0) * 6),
+            );
+            push_risk = push_risk.max(enemy_best_push_risk);
+        }
+    }
+
+    let edge_exposure_risk = boundary_exposure_risk(
+        board,
+        target,
+        worst_exits,
+        push_risk,
+        wraps,
+    );
+
+    AdversarialAnalysis {
+        worst_case_space: worst_space,
+        worst_case_exits: worst_exits,
+        escape_routes: worst_escape_routes,
+        enemy_cutoff_risk: cutoff_risk,
+        enemy_push_risk: push_risk,
+        edge_exposure_risk,
+    }
+}
+
+fn legal_enemy_projection(
+    game: &Game,
+    board: &Board,
+    you: &Battlesnake,
+    enemy: &Battlesnake,
+    our_target: Point,
+    our_projected_body: &[Point],
+    hazard_stacks: &HashMap<Point, i32>,
+    wraps: bool,
+) -> Vec<Vec<Point>> {
+    let enemy_head = Point::from(&enemy.head);
+    let enemy_neck = enemy.body.get(1).map(Point::from);
+    let food = point_set(&board.food);
+    let my_length = snake_length(you);
+    let mut projections = Vec::new();
+
+    for direction in DIRECTIONS.iter().copied() {
+        let Some(target) = direction.next(enemy_head, board, wraps) else {
+            continue;
+        };
+        if enemy_neck == Some(target) {
+            continue;
+        }
+
+        // Do not treat a move directly onto our projected head as a useful
+        // blocking response unless the enemy can actually survive that H2H.
+        if target == our_target {
+            let enemy_length = snake_length(enemy);
+            if enemy_length <= my_length {
+                continue;
+            }
+        }
+
+        let grows = is_constrictor(game) || food.contains(&target);
+        let body_end = if grows {
+            enemy.body.len()
+        } else {
+            enemy.body.len().saturating_sub(1)
+        };
+        if enemy.body[..body_end]
+            .iter()
+            .any(|segment| Point::from(segment) == target)
+        {
+            continue;
+        }
+
+        if board.snakes.iter().any(|snake| {
+            snake.id != enemy.id
+                && snake
+                    .body
+                    .iter()
+                    .any(|segment| Point::from(segment) == target)
+                && snake.id != you.id
+        }) {
+            continue;
+        }
+
+        if our_projected_body.contains(&target) && target != our_target {
+            continue;
+        }
+
+        let hazard_cost = if grows {
+            0
+        } else {
+            hazard_stacks.get(&target).copied().unwrap_or(0) * hazard_damage(game)
+        };
+        let health_after = if grows {
+            100
+        } else {
+            enemy.health - 1 - hazard_cost
+        };
+        if health_after <= 0 {
+            continue;
+        }
+
+        let mut projected = Vec::with_capacity(enemy.body.len() + 1);
+        projected.push(target);
+        projected.extend(enemy.body.iter().map(Point::from));
+        if !grows {
+            projected.pop();
+        }
+        projections.push(projected);
+    }
+
+    projections
+}
+
+fn count_escape_exits(
+    board: &Board,
+    start: Point,
+    blocked: &HashSet<Point>,
+    dangerous: &HashSet<Point>,
+    wraps: bool,
+) -> usize {
+    DIRECTIONS
+        .iter()
+        .filter_map(|direction| direction.next(start, board, wraps))
+        .filter(|point| !blocked.contains(point) && !dangerous.contains(point))
+        .count()
+}
+
+fn escape_routes_away_from_enemies(
+    board: &Board,
+    target: Point,
+    blocked: &HashSet<Point>,
+    dangerous: &HashSet<Point>,
+    primary_enemy_head: Point,
+    wraps: bool,
+) -> usize {
+    let target_distance = topology_distance(target, primary_enemy_head, board, wraps);
+
+    DIRECTIONS
+        .iter()
+        .filter_map(|direction| direction.next(target, board, wraps))
+        .filter(|point| !blocked.contains(point) && !dangerous.contains(point))
+        .filter(|point| topology_distance(*point, primary_enemy_head, board, wraps) > target_distance)
+        .count()
+}
+
+fn enemy_push_risk(
+    board: &Board,
+    target: Point,
+    blocked: &HashSet<Point>,
+    dangerous: &HashSet<Point>,
+    enemy_head: Point,
+    exits: i64,
+    escape_routes: i64,
+    wraps: bool,
+) -> i64 {
+    let distance = topology_distance(target, enemy_head, board, wraps);
+    let mut risk = 0_i64;
+
+    if distance <= PUSH_DISTANCE_THRESHOLD {
+        let proximity = (PUSH_DISTANCE_THRESHOLD - distance + 1).max(1);
+        if escape_routes == 0 {
+            risk += proximity * 180;
+        } else if escape_routes == 1 {
+            risk += proximity * 55;
+        }
+    }
+
+    if exits <= 1 {
+        risk += 1_200;
+    } else if exits == 2 && escape_routes == 0 {
+        risk += 550;
+    }
+
+    let interior_escape = DIRECTIONS
+        .iter()
+        .filter_map(|direction| direction.next(target, board, wraps))
+        .filter(|point| !blocked.contains(point) && !dangerous.contains(point))
+        .filter(|point| boundary_distance(*point, board) > boundary_distance(target, board))
+        .count() as i64;
+
+    if boundary_distance(target, board) <= 1 && exits <= 2 && interior_escape == 0 {
+        risk += 850;
+    }
+
+    risk
+}
+
+fn boundary_exposure_risk(
+    board: &Board,
+    target: Point,
+    worst_exits: i64,
+    push_risk: i64,
+    wraps: bool,
+) -> i64 {
+    if wraps {
+        return 0;
+    }
+
+    let edge = boundary_distance(target, board);
+    let mut risk = 0_i64;
+
+    if edge == 0 {
+        if worst_exits <= 1 {
+            risk += 2_000;
+        } else if worst_exits == 2 {
+            risk += 700;
+        }
+    } else if edge == 1 {
+        if worst_exits <= 1 {
+            risk += 1_200;
+        } else if worst_exits == 2 {
+            risk += 300;
+        }
+    }
+
+    if push_risk > 0 && edge <= 2 {
+        risk += (3 - edge) * 180;
+    }
+
+    risk
+}
+
+fn boundary_distance(point: Point, board: &Board) -> i64 {
+    let left = point.x.max(0);
+    let right = (board.width - 1 - point.x).max(0);
+    let bottom = point.y.max(0);
+    let top = (board.height - 1 - point.y).max(0);
+    left.min(right).min(bottom).min(top) as i64
+}
+
+fn topology_distance(a: Point, b: Point, board: &Board, wraps: bool) -> i64 {
+    let dx = (a.x - b.x).abs() as i64;
+    let dy = (a.y - b.y).abs() as i64;
+
+    if wraps {
+        let width = board.width.max(1) as i64;
+        let height = board.height.max(1) as i64;
+        let wrapped_dx = dx.rem_euclid(width);
+        let wrapped_dy = dy.rem_euclid(height);
+        wrapped_dx.min(width - wrapped_dx) + wrapped_dy.min(height - wrapped_dy)
+    } else {
+        dx + dy
+    }
 }
 
 /// Assume each opponent chooses its legal head move that minimizes our
@@ -1793,6 +2220,71 @@ mod tests {
             response["move"].as_str(),
             Some("up" | "down" | "left" | "right")
         ));
+    }
+
+
+    #[test]
+    fn anti_corner_prefers_a_move_with_two_enemy_resistant_exits() {
+        let me = snake("me", 100, &[(2, 2), (2, 1), (1, 1)]);
+        let enemy = snake("enemy", 100, &[(4, 2), (4, 1), (4, 0)]);
+        let board = board(
+            7,
+            7,
+            &[],
+            &[],
+            vec![
+                snake("me", 100, &[(2, 2), (2, 1), (1, 1)]),
+                enemy,
+            ],
+        );
+
+        let chosen = select_direction(&game("standard", None), &board, &me);
+        assert_ne!(chosen, Direction::Right);
+    }
+
+    #[test]
+    fn detects_an_enemy_that_can_remove_our_last_escape_route() {
+        let me = snake("me", 100, &[(0, 0), (1, 0)]);
+        let enemy = snake("enemy", 100, &[(1, 2), (2, 2)]);
+        let board = board(
+            5,
+            5,
+            &[],
+            &[],
+            vec![
+                snake("me", 100, &[(0, 0), (1, 0)]),
+                snake("enemy", 100, &[(1, 2), (2, 2)]),
+            ],
+        );
+        let target = Point { x: 0, y: 1 };
+        let projected = projected_body(&me, target, false);
+        let dangerous = HashSet::new();
+        let hazards = hazard_counts(&board.hazards);
+
+        let analysis = adversarial_escape_analysis(
+            &game("standard", None),
+            &board,
+            &me,
+            target,
+            &projected,
+            &dangerous,
+            &hazards,
+            false,
+            2,
+            20,
+        );
+
+        assert!(analysis.worst_case_exits <= 1);
+        assert!(analysis.enemy_cutoff_risk > 0);
+    }
+
+    #[test]
+    fn boundary_exposure_is_zero_on_wrapped_maps() {
+        let board = board(5, 5, &[], &[], vec![]);
+        assert_eq!(
+            boundary_exposure_risk(&board, Point { x: 0, y: 2 }, 1, 500, true),
+            0
+        );
     }
 
     #[test]

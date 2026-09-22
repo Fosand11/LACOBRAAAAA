@@ -148,6 +148,12 @@ struct Candidate {
     enemy_pressure: i64,
     adversarial_space: usize,
     future_space: i64,
+    worst_case_space: usize,
+    worst_case_exits: i64,
+    escape_routes: i64,
+    enemy_cutoff_risk: i64,
+    enemy_push_risk: i64,
+    edge_exposure_risk: i64,
     loses_head_to_head: bool,
 }
 
@@ -1550,94 +1556,6 @@ fn topology_distance(a: Point, b: Point, board: &Board, wraps: bool) -> i64 {
     }
 }
 
-/// Assume each opponent chooses its legal head move that minimizes our
-/// reachable space. This is a bounded one-ply adversarial search rather than
-/// a full minimax tree, so it stays cheap enough for Battlesnake's move budget.
-fn worst_case_enemy_space(
-    game: &Game,
-    board: &Board,
-    you: &Battlesnake,
-    our_target: Point,
-    our_projected_body: &[Point],
-    base_blocked: &HashSet<Point>,
-    dangerous: &HashSet<Point>,
-    wraps: bool,
-) -> usize {
-    let mut worst = usize::MAX;
-    let constrictor = is_constrictor(game);
-    let food = point_set(&board.food);
-
-    for enemy in board.snakes.iter().filter(|snake| snake.id != you.id) {
-        let enemy_head = Point::from(&enemy.head);
-        let enemy_neck = enemy.body.get(1).map(Point::from);
-        let mut enemy_moves = Vec::new();
-
-        for direction in DIRECTIONS.iter().copied() {
-            let Some(enemy_target) = direction.next(enemy_head, board, wraps) else {
-                continue;
-            };
-
-            if enemy_neck == Some(enemy_target) {
-                continue;
-            }
-
-            let occupied_by_other = board.snakes.iter().any(|snake| {
-                snake.id != enemy.id
-                    && snake
-                        .body
-                        .iter()
-                        .any(|segment| Point::from(segment) == enemy_target)
-            });
-
-            if occupied_by_other || our_projected_body.contains(&enemy_target) {
-                continue;
-            }
-
-            let grows = constrictor || food.contains(&enemy_target);
-            let mut projected_enemy = Vec::with_capacity(enemy.body.len() + 1);
-            projected_enemy.push(enemy_target);
-            projected_enemy.extend(enemy.body.iter().map(Point::from));
-
-            if !grows {
-                projected_enemy.pop();
-            }
-
-            enemy_moves.push(projected_enemy);
-        }
-
-        if enemy_moves.is_empty() {
-            continue;
-        }
-
-        let mut enemy_worst = usize::MAX;
-
-        for projected_enemy in enemy_moves {
-            let mut blocked = base_blocked.clone();
-
-            for segment in &enemy.body {
-                blocked.remove(&Point::from(segment));
-            }
-
-            blocked.remove(&our_target);
-            blocked.extend(projected_enemy.iter().copied());
-            blocked.extend(our_projected_body.iter().copied());
-
-            let (space, _) =
-                reachable_space(board, our_target, &blocked, dangerous, wraps);
-
-            enemy_worst = enemy_worst.min(space);
-        }
-
-        worst = worst.min(enemy_worst);
-    }
-
-    if worst == usize::MAX {
-        reachable_space(board, our_target, base_blocked, dangerous, wraps).0
-    } else {
-        worst
-    }
-}
-
 /// Score the first few BFS layers so a wide room beats a long narrow tunnel.
 fn future_space_score(
     board: &Board,
@@ -2244,19 +2162,23 @@ mod tests {
 
     #[test]
     fn detects_an_enemy_that_can_remove_our_last_escape_route() {
-        let me = snake("me", 100, &[(0, 0), (1, 0)]);
-        let enemy = snake("enemy", 100, &[(1, 2), (2, 2)]);
+        // After moving to (0, 2), our two meaningful exits are up and right.
+        // The enemy at (1, 3) can move to either (0, 3) or (1, 2), removing one
+        // of those exits. Our old tail at (1, 0) vacates, so the fixture does
+        // not rely on a tail that is incorrectly treated as permanently blocked.
+        let me = snake("me", 100, &[(0, 1), (0, 0), (1, 0)]);
+        let _enemy = snake("enemy", 100, &[(1, 3), (2, 3)]);
         let board = board(
             5,
             5,
             &[],
             &[],
             vec![
-                snake("me", 100, &[(0, 0), (1, 0)]),
-                snake("enemy", 100, &[(1, 2), (2, 2)]),
+                snake("me", 100, &[(0, 1), (0, 0), (1, 0)]),
+                snake("enemy", 100, &[(1, 3), (2, 3)]),
             ],
         );
-        let target = Point { x: 0, y: 1 };
+        let target = Point { x: 0, y: 2 };
         let projected = projected_body(&me, target, false);
         let dangerous = HashSet::new();
         let hazards = hazard_counts(&board.hazards);

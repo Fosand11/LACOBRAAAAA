@@ -79,6 +79,11 @@ const STRATEGIC_COMMITMENT_WEIGHT: i64 = 520;
 const STRATEGIC_ESCAPE_WEIGHT: i64 = 420;
 const FOOD_IN_CERCO_PENALTY: i64 = 18_000;
 
+// V2.4: future escape preservation. When at least one candidate leaves
+// a real escape route after the enemy response, prefer that pool over
+// candidates whose projected continuation has no escape route.
+const MIN_FUTURE_ESCAPE_PREFERENCE: i64 = 1;
+
 const FOOD_RESCUE_HEALTH: i32 = 35;
 const FOOD_RESCUE_WEIGHT: i64 = 180;
 
@@ -355,10 +360,19 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
         open_positions
     };
 
-    // V2.3: strategic escape preservation. We first prefer moves for which
-    // the enemy's best response still leaves us a real defensive continuation.
-    // This is deliberately a preference with a fallback: on genuinely bad
-    // boards we still choose the least-bad legal move instead of panicking.
+    // V2.4: preserve a real future escape route before comparing score.
+    // V2.3 could identify a candidate with future_escape_routes == 0, but the
+    // final scalar score could still select it when the alternatives had a
+    // safer continuation. That is exactly what appeared in replay turn 18.
+    //
+    // This remains a preference with fallback rather than an absolute ban: if
+    // every candidate loses its future escape, we continue with the normal
+    // strategic filters; forced kills remain exempt.
+    let pool = prefer_future_escape(pool);
+
+    // V2.3: strategic escape preservation. We still remove candidates that
+    // are actively exposed to enemy funnel/corner pressure when a cleaner
+    // alternative exists.
     let strategic_safe: Vec<&Candidate> = pool
         .iter()
         .copied()
@@ -372,6 +386,23 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
 
     finish_selection(game, pool)
 
+}
+
+fn prefer_future_escape<'a>(pool: Vec<&'a Candidate>) -> Vec<&'a Candidate> {
+    let preferred: Vec<&Candidate> = pool
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate.forced_kill
+                || candidate.future_escape_routes >= MIN_FUTURE_ESCAPE_PREFERENCE
+        })
+        .collect();
+
+    if preferred.is_empty() {
+        pool
+    } else {
+        preferred
+    }
 }
 
 fn finish_selection(game: &Game, pool: Vec<&Candidate>) -> Direction {
@@ -2608,6 +2639,47 @@ mod tests {
             boundary_exposure_risk(&board, Point { x: 0, y: 2 }, 1, 500, true),
             0
         );
+    }
+
+    #[test]
+    fn prefers_a_candidate_with_a_future_escape_route() {
+        let trapped = Candidate {
+            direction: Direction::Right,
+            score: 100_000,
+            health_after: 90,
+            space: 110,
+            exits: 2,
+            eating: false,
+            territory: 50,
+            forced_kill: false,
+            future_survival: 18_000,
+            trap_risk: 0,
+            enemy_pressure: 0,
+            adversarial_space: 110,
+            future_space: 120,
+            worst_case_space: 110,
+            worst_case_exits: 2,
+            escape_routes: 1,
+            future_worst_exits: 2,
+            future_escape_routes: 0,
+            enemy_cutoff_risk: 1_000,
+            enemy_push_risk: 2_900,
+            edge_exposure_risk: 1_200,
+            commitment_risk: 6_600,
+            loses_head_to_head: false,
+        };
+        let safe = Candidate {
+            direction: Direction::Up,
+            score: -100_000,
+            future_escape_routes: 1,
+            ..trapped
+        };
+
+        let pool = vec![&trapped, &safe];
+        let preferred = prefer_future_escape(pool);
+
+        assert_eq!(preferred.len(), 1);
+        assert_eq!(preferred[0].direction, Direction::Up);
     }
 
     #[test]

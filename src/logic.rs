@@ -1,4 +1,4 @@
-//! A survival-first Battlesnake with local geometry and lightweight adversarial search.
+//! A survival-first Battlesnake with local geometry and deep adversarial search.
 //!
 //! The priority order is: avoid certain death, avoid losing head-to-heads, avoid
 //! traps, preserve future manoeuvring room, account for enemy pressure, then use
@@ -9,7 +9,7 @@ use log::{debug, info, warn};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{Battlesnake, Board, Coord, Game};
 
@@ -83,6 +83,29 @@ const FOOD_IN_CERCO_PENALTY: i64 = 18_000;
 // a real escape route after the enemy response, prefer that pool over
 // candidates whose projected continuation has no escape route.
 const MIN_FUTURE_ESCAPE_PREFERENCE: i64 = 1;
+
+// V2.5: deep adversarial prediction. The shallow evaluator already models one
+// enemy response plus one defensive move. This deeper layer performs a bounded
+// minimax-style search: enemy chooses the continuation that hurts us most, while
+// we choose the continuation that preserves our survival. Eight plies means four
+// enemy responses and four of our responses after the candidate move.
+const DEEP_PLY: usize = 10;
+const DEEP_BRANCH_WIDTH: usize = 4;
+const DEEP_MAX_NODES: u64 = 750_000;
+const DEEP_MAX_TEST_NODES: u64 = 5_000_000;
+const DEEP_DEADLINE_FRACTION: u128 = 85;
+const DEEP_SAFE_MIN_EXITS: i64 = 2;
+const DEEP_SAFE_MIN_ESCAPE: i64 = 1;
+const DEEP_SAFE_SURVIVAL: usize = DEEP_PLY;
+const DEEP_LOSS_SCORE: i64 = -1_000_000_000;
+const DEEP_WIN_SCORE: i64 = 1_000_000_000;
+
+// V2.6 offensive evaluation: once our own safety floor is intact, prefer
+// positions that reduce the opponent's reachable area and mobility.
+const DEEP_ENEMY_SPACE_WEIGHT: i64 = 90;
+const DEEP_ENEMY_EXIT_WEIGHT: i64 = 6_000;
+const DEEP_ENEMY_ESCAPE_WEIGHT: i64 = 3_000;
+const DEEP_ENEMY_TRAP_BONUS: i64 = 28_000;
 
 const FOOD_RESCUE_HEALTH: i32 = 35;
 const FOOD_RESCUE_WEIGHT: i64 = 180;
@@ -252,6 +275,11 @@ pub fn end(game: &Game, turn: &i32, board: &Board, you: &Battlesnake) {
 /// hit a body, or run out of health. A losing head-to-head is retained as a
 /// last resort, but is never selected when another survivable move exists.
 fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction {
+    let started = Instant::now();
+    let timeout_ms = u128::from(game.timeout);
+    let deep_budget_ms = timeout_ms * DEEP_DEADLINE_FRACTION / 100;
+    let deep_deadline = started + Duration::from_millis(deep_budget_ms as u64);
+
     let candidates: Vec<Candidate> = DIRECTIONS
         .iter()
         .filter_map(|direction| evaluate_move(*direction, game, board, you))
@@ -384,7 +412,13 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
         strategic_safe
     };
 
-    finish_selection(game, pool)
+    // V2.5: replace scalar-only selection with a deeper adversarial check when
+    // there is enough time left. This asks a stronger question than V2.4:
+    // "over several alternating moves, can an enemy force us into a collapse?"
+    // A deep-safe line is preferred over a line that only looks safe for one or
+    // two turns. If the deep search times out or cannot establish a safe line,
+    // the mature V2.4 selector remains the fallback.
+    deep_select_direction(game, board, you, pool, deep_deadline)
 
 }
 
@@ -441,6 +475,791 @@ fn finish_selection(game: &Game, pool: Vec<&Candidate>) -> Direction {
         best.commitment_risk
     );
     best.direction
+}
+
+
+#[derive(Clone)]
+struct DeepState {
+    our_body: Vec<Point>,
+    our_health: i32,
+    enemy_body: Vec<Point>,
+    enemy_health: i32,
+    eaten_food: u128,
+    our_alive: bool,
+    enemy_alive: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeepEval {
+    score: i64,
+    survival_plies: usize,
+    min_exits: i64,
+    min_escape_routes: i64,
+    min_space: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeepPrediction {
+    score: i64,
+    survival_plies: usize,
+    min_exits: i64,
+    min_escape_routes: i64,
+    min_space: usize,
+    nodes: u64,
+    timed_out: bool,
+}
+
+struct DeepSearchControl {
+    deadline: Instant,
+    nodes: u64,
+    timed_out: bool,
+    max_nodes: u64,
+}
+
+#[derive(Clone, Copy)]
+enum DeepActor {
+    OurSnake,
+    Enemy,
+}
+
+fn deep_select_direction(
+    game: &Game,
+    board: &Board,
+    you: &Battlesnake,
+    pool: Vec<&Candidate>,
+    deadline: Instant,
+) -> Direction {
+    if pool.len() <= 1 {
+        return finish_selection(game, pool);
+    }
+
+    let mut predictions: Vec<(&Candidate, DeepPrediction)> = Vec::with_capacity(pool.len());
+    for candidate in &pool {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let prediction = deep_prediction_for_candidate(game, board, you, candidate, deadline);
+        info!(
+            "DEEP_CANDIDATE id={} direction={} score={} survival_plies={} min_exits={} min_escape_routes={} min_space={} nodes={} timed_out={}",
+            game.id,
+            candidate.direction.name(),
+            prediction.score,
+            prediction.survival_plies,
+            prediction.min_exits,
+            prediction.min_escape_routes,
+            prediction.min_space,
+            prediction.nodes,
+            prediction.timed_out
+        );
+        predictions.push((*candidate, prediction));
+    }
+
+    if predictions.is_empty() {
+        return finish_selection(game, pool);
+    }
+
+    let all_deep_predictions_complete = predictions.len() == pool.len()
+        && predictions.iter().all(|(_, prediction)| !prediction.timed_out);
+
+    // First preference: lines that survive the full deep horizon while keeping
+    // at least two exits and one genuine escape route in the worst line. We only
+    // activate this layer when every candidate received a complete prediction;
+    // partial deep information must never hide an unexamined option.
+    let deep_safe: Vec<(&Candidate, DeepPrediction)> = if all_deep_predictions_complete {
+        predictions
+            .iter()
+            .copied()
+            .filter(|(_, prediction)| {
+                prediction.survival_plies >= DEEP_SAFE_SURVIVAL
+                    && prediction.min_exits >= DEEP_SAFE_MIN_EXITS
+                    && prediction.min_escape_routes >= DEEP_SAFE_MIN_ESCAPE
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if !deep_safe.is_empty() {
+        let chosen = deep_safe
+            .into_iter()
+            .max_by_key(|(candidate, prediction)| {
+                (
+                    prediction.min_escape_routes,
+                    prediction.min_exits,
+                    prediction.min_space.min(200),
+                    candidate.score,
+                )
+            })
+            .expect("deep_safe is non-empty");
+        info!(
+            "DEEP_DECISION id={} direction={} mode=safe survival_plies={} min_exits={} min_escape_routes={} min_space={} nodes={} timed_out={}",
+            game.id,
+            chosen.0.direction.name(),
+            chosen.1.survival_plies,
+            chosen.1.min_exits,
+            chosen.1.min_escape_routes,
+            chosen.1.min_space,
+            chosen.1.nodes,
+            chosen.1.timed_out
+        );
+        return chosen.0.direction;
+    }
+
+    // Second preference: when no full-horizon safe line exists, use the
+    // deepest complete prediction only when every candidate was actually
+    // analyzed. A partial search must never make us discard an unexamined
+    // candidate just because the first one happened to finish before the
+    // deadline.
+    let complete: Vec<(&Candidate, DeepPrediction)> = if all_deep_predictions_complete {
+        predictions
+            .iter()
+            .copied()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !complete.is_empty() {
+        let chosen = complete
+            .into_iter()
+            .max_by_key(|(candidate, prediction)| {
+                (
+                    prediction.survival_plies,
+                    prediction.min_escape_routes,
+                    prediction.min_exits,
+                    prediction.min_space.min(200),
+                    candidate.score,
+                )
+            })
+            .expect("complete is non-empty");
+        info!(
+            "DEEP_DECISION id={} direction={} mode=deepest survival_plies={} min_exits={} min_escape_routes={} min_space={} nodes={} timed_out={}",
+            game.id,
+            chosen.0.direction.name(),
+            chosen.1.survival_plies,
+            chosen.1.min_exits,
+            chosen.1.min_escape_routes,
+            chosen.1.min_space,
+            chosen.1.nodes,
+            chosen.1.timed_out
+        );
+        return chosen.0.direction;
+    }
+
+    finish_selection(game, pool)
+}
+
+fn deep_prediction_for_candidate(
+    game: &Game,
+    board: &Board,
+    you: &Battlesnake,
+    candidate: &Candidate,
+    deadline: Instant,
+) -> DeepPrediction {
+    deep_prediction_for_candidate_with_limits(
+        game,
+        board,
+        you,
+        candidate,
+        deadline,
+        DEEP_MAX_NODES,
+    )
+}
+
+fn deep_prediction_for_candidate_with_limits(
+    game: &Game,
+    board: &Board,
+    you: &Battlesnake,
+    candidate: &Candidate,
+    deadline: Instant,
+    max_nodes: u64,
+) -> DeepPrediction {
+    let wraps = is_wrapped(game);
+    let food = point_set(&board.food);
+    let hazards = hazard_counts(&board.hazards);
+    let dangerous = larger_head_territory(
+        board,
+        you,
+        snake_length(you) + i32::from(candidate.eating),
+        wraps,
+    );
+    let target = candidate_target(you, candidate.direction, board, wraps)
+        .unwrap_or_else(|| Point::from(&you.head));
+    let grows = candidate.eating || is_constrictor(game);
+    let our_body = projected_body(you, target, grows);
+
+    let mut worst: Option<DeepPrediction> = None;
+    let mut total_nodes = 0_u64;
+    let mut timed_out = false;
+
+    for enemy in board.snakes.iter().filter(|snake| snake.id != you.id) {
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+
+        let state = DeepState {
+            our_body: our_body.clone(),
+            our_health: candidate.health_after,
+            enemy_body: enemy.body.iter().map(Point::from).collect(),
+            enemy_health: enemy.health,
+            eaten_food: if candidate.eating {
+                food_mask(target, &board.food)
+            } else {
+                0
+            },
+            our_alive: true,
+            enemy_alive: true,
+        };
+
+        let static_blocked: HashSet<Point> = board
+            .snakes
+            .iter()
+            .filter(|snake| snake.id != you.id && snake.id != enemy.id)
+            .flat_map(|snake| snake.body.iter().map(Point::from))
+            .collect();
+
+        let mut control = DeepSearchControl {
+            deadline,
+            nodes: 0,
+            timed_out: false,
+            max_nodes,
+        };
+        let result = deep_minimax(
+            game,
+            board,
+            you,
+            &food,
+            &hazards,
+            &dangerous,
+            &static_blocked,
+            wraps,
+            &state,
+            DeepActor::Enemy,
+            DEEP_PLY,
+            0,
+            &mut control,
+            DEEP_LOSS_SCORE,
+            DEEP_WIN_SCORE,
+        );
+        total_nodes += control.nodes;
+        timed_out |= control.timed_out;
+
+        let prediction = DeepPrediction {
+            score: result.score,
+            survival_plies: result.survival_plies,
+            min_exits: result.min_exits,
+            min_escape_routes: result.min_escape_routes,
+            min_space: result.min_space,
+            nodes: control.nodes,
+            timed_out: control.timed_out,
+        };
+
+        let should_replace = worst.is_none_or(|current: DeepPrediction| {
+            (
+                prediction.score,
+                prediction.survival_plies,
+                prediction.min_escape_routes,
+                prediction.min_exits,
+            ) < (
+                current.score,
+                current.survival_plies,
+                current.min_escape_routes,
+                current.min_exits,
+            )
+        });
+        if should_replace {
+            worst = Some(prediction);
+        }
+    }
+
+    worst.unwrap_or(DeepPrediction {
+        score: 0,
+        survival_plies: DEEP_PLY,
+        min_exits: 4,
+        min_escape_routes: 2,
+        min_space: board.width.max(0) as usize * board.height.max(0) as usize,
+        nodes: total_nodes,
+        timed_out,
+    })
+}
+
+fn candidate_target(
+    you: &Battlesnake,
+    direction: Direction,
+    board: &Board,
+    wraps: bool,
+) -> Option<Point> {
+    direction.next(Point::from(&you.head), board, wraps)
+}
+
+fn deep_minimax(
+    game: &Game,
+    board: &Board,
+    you: &Battlesnake,
+    food: &HashSet<Point>,
+    hazards: &HashMap<Point, i32>,
+    dangerous: &HashSet<Point>,
+    static_blocked: &HashSet<Point>,
+    wraps: bool,
+    state: &DeepState,
+    actor: DeepActor,
+    depth_remaining: usize,
+    depth_from_root: usize,
+    control: &mut DeepSearchControl,
+    mut alpha: i64,
+    mut beta: i64,
+) -> DeepEval {
+    control.nodes += 1;
+    if control.nodes >= control.max_nodes || Instant::now() >= control.deadline {
+        control.timed_out = true;
+        return deep_eval_state(board, state, static_blocked, dangerous, wraps, depth_from_root);
+    }
+
+    if !state.our_alive {
+        return DeepEval {
+            score: DEEP_LOSS_SCORE + depth_from_root as i64,
+            survival_plies: depth_from_root,
+            min_exits: 0,
+            min_escape_routes: 0,
+            min_space: 0,
+        };
+    }
+
+    if depth_remaining == 0 || !state.enemy_alive {
+        return deep_eval_state(board, state, static_blocked, dangerous, wraps, depth_from_root);
+    }
+
+    let states = deep_generate_moves(
+        game,
+        board,
+        you,
+        food,
+        hazards,
+        dangerous,
+        static_blocked,
+        wraps,
+        state,
+        actor,
+    );
+
+    if states.is_empty() {
+        if matches!(actor, DeepActor::OurSnake) {
+            return DeepEval {
+                score: DEEP_LOSS_SCORE + depth_from_root as i64,
+                survival_plies: depth_from_root,
+                min_exits: 0,
+                min_escape_routes: 0,
+                min_space: 0,
+            };
+        }
+
+        // If the enemy has no legal move, it dies under Battlesnake rules.
+        // Treating this as a neutral leaf was making the offensive search miss
+        // genuine squeeze/trap wins.
+        let mut dead_enemy = state.clone();
+        dead_enemy.enemy_alive = false;
+        return deep_eval_state(
+            board,
+            &dead_enemy,
+            static_blocked,
+            dangerous,
+            wraps,
+            depth_from_root,
+        );
+    }
+
+    let mut ranked = states;
+    ranked.sort_unstable_by(|a, b| {
+        let a_score = deep_quick_state_score(board, a, dangerous, wraps);
+        let b_score = deep_quick_state_score(board, b, dangerous, wraps);
+        match actor {
+            DeepActor::OurSnake => b_score.cmp(&a_score),
+            DeepActor::Enemy => a_score.cmp(&b_score),
+        }
+    });
+    ranked.truncate(DEEP_BRANCH_WIDTH);
+
+    let mut best: Option<DeepEval> = None;
+    for child in ranked {
+        let child_eval = deep_minimax(
+            game,
+            board,
+            you,
+            food,
+            hazards,
+            dangerous,
+            static_blocked,
+            wraps,
+            &child,
+            match actor {
+                DeepActor::OurSnake => DeepActor::Enemy,
+                DeepActor::Enemy => DeepActor::OurSnake,
+            },
+            depth_remaining - 1,
+            depth_from_root + 1,
+            control,
+            alpha,
+            beta,
+        );
+
+        let (current_exits, current_escape) = deep_quick_escape_metrics(
+            board,
+            state,
+            dangerous,
+            wraps,
+        );
+        let child_eval = DeepEval {
+            score: child_eval.score,
+            survival_plies: child_eval.survival_plies.max(depth_from_root + 1),
+            min_exits: child_eval.min_exits.min(current_exits),
+            min_escape_routes: child_eval.min_escape_routes.min(current_escape),
+            min_space: child_eval.min_space,
+        };
+
+        let better = best.is_none_or(|previous| match actor {
+            DeepActor::OurSnake => deep_eval_is_better_for_us(child_eval, previous),
+            DeepActor::Enemy => deep_eval_is_worse_for_us(child_eval, previous),
+        });
+        if better {
+            best = Some(child_eval);
+        }
+
+        match actor {
+            DeepActor::OurSnake => {
+                alpha = alpha.max(child_eval.score);
+            }
+            DeepActor::Enemy => {
+                beta = beta.min(child_eval.score);
+            }
+        }
+
+        if beta <= alpha || control.timed_out {
+            break;
+        }
+    }
+
+    best.unwrap_or_else(|| deep_eval_state(board, state, static_blocked, dangerous, wraps, depth_from_root))
+}
+
+fn deep_eval_is_better_for_us(a: DeepEval, b: DeepEval) -> bool {
+    (a.score, a.survival_plies, a.min_escape_routes, a.min_exits, a.min_space)
+        > (b.score, b.survival_plies, b.min_escape_routes, b.min_exits, b.min_space)
+}
+
+fn deep_eval_is_worse_for_us(a: DeepEval, b: DeepEval) -> bool {
+    (a.score, a.survival_plies, a.min_escape_routes, a.min_exits, a.min_space)
+        < (b.score, b.survival_plies, b.min_escape_routes, b.min_exits, b.min_space)
+}
+
+fn deep_generate_moves(
+    game: &Game,
+    board: &Board,
+    _you: &Battlesnake,
+    food: &HashSet<Point>,
+    hazards: &HashMap<Point, i32>,
+    dangerous: &HashSet<Point>,
+    static_blocked: &HashSet<Point>,
+    wraps: bool,
+    state: &DeepState,
+    actor: DeepActor,
+) -> Vec<DeepState> {
+    let (body, health, enemy_body, _enemy_health, our_turn) = match actor {
+        DeepActor::OurSnake => (
+            &state.our_body,
+            state.our_health,
+            &state.enemy_body,
+            state.enemy_health,
+            true,
+        ),
+        DeepActor::Enemy => (
+            &state.enemy_body,
+            state.enemy_health,
+            &state.our_body,
+            state.our_health,
+            false,
+        ),
+    };
+
+    let head = body[0];
+    let neck = body.get(1).copied();
+    let enemy_head = enemy_body[0];
+    let mut result = Vec::new();
+
+    for direction in DIRECTIONS.iter().copied() {
+        let Some(target) = direction.next(head, board, wraps) else {
+            continue;
+        };
+        if neck == Some(target) {
+            continue;
+        }
+
+        let food_here = food.contains(&target)
+            && state.eaten_food & food_mask(target, &board.food) == 0;
+        let grows = is_constrictor(game) || food_here;
+        let own_body_end = if grows {
+            body.len()
+        } else {
+            body.len().saturating_sub(1)
+        };
+        if body[..own_body_end].contains(&target) {
+            continue;
+        }
+
+        if static_blocked.contains(&target) {
+            continue;
+        }
+
+        let mut kills_other = false;
+        if target == enemy_head {
+            let actor_length = body.len() as i32 + i32::from(grows);
+            let enemy_length = enemy_body.len() as i32;
+            if actor_length <= enemy_length {
+                continue;
+            }
+            kills_other = true;
+        } else if enemy_body.contains(&target) {
+            continue;
+        }
+
+        // The deep model intentionally treats the enemy as an adversary. The
+        // enemy is allowed to choose a move onto our head only when it can win
+        // that head-to-head. That becomes an explicit terminal loss for us.
+        if !our_turn && target == state.our_body[0] {
+            let enemy_length = body.len() as i32 + i32::from(grows);
+            let our_length = state.our_body.len() as i32;
+            if enemy_length <= our_length {
+                continue;
+            }
+            let mut killed = state.clone();
+            killed.our_alive = false;
+            killed.enemy_health = if grows { 100 } else { health - 1 };
+            result.push(killed);
+            continue;
+        }
+
+        if our_turn && dangerous.contains(&target) {
+            continue;
+        }
+
+        let hazard_cost = hazards.get(&target).copied().unwrap_or(0) * hazard_damage(game);
+        let next_health = if grows { 100 } else { health - 1 - hazard_cost };
+        if next_health <= 0 {
+            continue;
+        }
+
+        let mut next_body = Vec::with_capacity(body.len() + 1);
+        next_body.push(target);
+        next_body.extend(body.iter().copied());
+        if !grows {
+            next_body.pop();
+        }
+
+        let mut next = state.clone();
+        next.eaten_food |= if food_here {
+            food_mask(target, &board.food)
+        } else {
+            0
+        };
+
+        if our_turn {
+            next.our_body = next_body;
+            next.our_health = next_health;
+            if kills_other {
+                next.enemy_alive = false;
+                next.enemy_body = vec![enemy_head];
+            }
+        } else {
+            next.enemy_body = next_body;
+            next.enemy_health = next_health;
+            if kills_other {
+                next.our_alive = false;
+            }
+        }
+
+        result.push(next);
+    }
+
+    result
+}
+
+fn deep_quick_state_score(
+    board: &Board,
+    state: &DeepState,
+    dangerous: &HashSet<Point>,
+    wraps: bool,
+) -> i64 {
+    if !state.our_alive {
+        return DEEP_LOSS_SCORE;
+    }
+
+    let (exits, escape) = deep_quick_escape_metrics(board, state, dangerous, wraps);
+    let edge = boundary_distance(state.our_body[0], board);
+    let enemy_distance = topology_distance(state.our_body[0], state.enemy_body[0], board, wraps);
+    let (enemy_space, enemy_exits, enemy_escape) = deep_enemy_mobility(board, state, wraps);
+    let our_safe = exits >= 2 && escape >= 1;
+    let offensive = if state.enemy_alive && our_safe {
+        (board.width.max(0) as i64 * board.height.max(0) as i64 - enemy_space as i64).max(0)
+            * DEEP_ENEMY_SPACE_WEIGHT
+            + (4 - enemy_exits).max(0) * DEEP_ENEMY_EXIT_WEIGHT
+            + (2 - enemy_escape).max(0) * DEEP_ENEMY_ESCAPE_WEIGHT
+    } else {
+        0
+    };
+    exits * 18_000
+        + escape * 16_000
+        + edge * 700
+        + state.our_health as i64 * 20
+        - enemy_distance * 300
+        + offensive
+        + if state.enemy_alive { 0 } else { 100_000 }
+}
+
+fn deep_quick_escape_metrics(
+    board: &Board,
+    state: &DeepState,
+    dangerous: &HashSet<Point>,
+    wraps: bool,
+) -> (i64, i64) {
+    if !state.our_alive {
+        return (0, 0);
+    }
+
+    let mut blocked = HashSet::new();
+    blocked.extend(state.our_body.iter().copied());
+    blocked.extend(state.enemy_body.iter().copied());
+    if let Some(tail) = state.our_body.last().copied() {
+        blocked.remove(&tail);
+    }
+
+    let exits = count_escape_exits(board, state.our_body[0], &blocked, dangerous, wraps) as i64;
+    let escape = escape_routes_away_from_enemies(
+        board,
+        state.our_body[0],
+        &blocked,
+        dangerous,
+        state.enemy_body[0],
+        wraps,
+    ) as i64;
+    (exits, escape)
+}
+
+fn deep_enemy_mobility(
+    board: &Board,
+    state: &DeepState,
+    wraps: bool,
+) -> (usize, i64, i64) {
+    if !state.enemy_alive {
+        return (0, 0, 0);
+    }
+
+    let mut blocked = HashSet::new();
+    blocked.extend(state.our_body.iter().copied());
+    blocked.extend(state.enemy_body.iter().copied());
+    if let Some(tail) = state.enemy_body.last().copied() {
+        blocked.remove(&tail);
+    }
+
+    let enemy_head = state.enemy_body[0];
+    let empty_danger = HashSet::new();
+    let exits = count_escape_exits(board, enemy_head, &blocked, &empty_danger, wraps) as i64;
+    let escape = escape_routes_away_from_enemies(
+        board,
+        enemy_head,
+        &blocked,
+        &empty_danger,
+        state.our_body[0],
+        wraps,
+    ) as i64;
+    let (space, _) = reachable_space(board, enemy_head, &blocked, &empty_danger, wraps);
+    (space, exits, escape)
+}
+
+fn deep_eval_state(
+    board: &Board,
+    state: &DeepState,
+    static_blocked: &HashSet<Point>,
+    dangerous: &HashSet<Point>,
+    wraps: bool,
+    depth_from_root: usize,
+) -> DeepEval {
+    if !state.our_alive {
+        return DeepEval {
+            score: DEEP_LOSS_SCORE + depth_from_root as i64,
+            survival_plies: depth_from_root,
+            min_exits: 0,
+            min_escape_routes: 0,
+            min_space: 0,
+        };
+    }
+
+    let mut blocked = static_blocked.clone();
+    blocked.extend(state.our_body.iter().copied());
+    blocked.extend(state.enemy_body.iter().copied());
+    if let Some(tail) = state.our_body.last().copied() {
+        blocked.remove(&tail);
+    }
+
+    let exits = count_escape_exits(board, state.our_body[0], &blocked, dangerous, wraps) as i64;
+    let escape_routes = escape_routes_away_from_enemies(
+        board,
+        state.our_body[0],
+        &blocked,
+        dangerous,
+        state.enemy_body[0],
+        wraps,
+    ) as i64;
+    let (space, _) = reachable_space(board, state.our_body[0], &blocked, dangerous, wraps);
+    let edge = boundary_distance(state.our_body[0], board);
+    let (enemy_space, enemy_exits, enemy_escape) = deep_enemy_mobility(board, state, wraps);
+
+    let mut score = space as i64 * 320
+        + exits * 18_000
+        + escape_routes * 16_000
+        + edge * 700
+        + state.our_health as i64 * 25;
+
+    if exits <= 1 {
+        score -= 45_000;
+    }
+    if escape_routes == 0 {
+        score -= 60_000;
+    }
+    if edge == 0 && exits <= 2 {
+        score -= 25_000;
+    }
+    if state.enemy_alive {
+        let enemy_distance = topology_distance(
+            state.our_body[0],
+            state.enemy_body[0],
+            board,
+            wraps,
+        );
+        score -= enemy_distance.saturating_sub(2) * 180;
+
+        // Offensive objective: once our own position is defensible, make the
+        // enemy's world smaller. This turns the deep search into a predator
+        // rather than a pure avoid-everything snake.
+        if exits >= 2 && escape_routes >= 1 {
+            let board_area = board.width.max(0) as i64 * board.height.max(0) as i64;
+            score += (board_area - enemy_space as i64).max(0) * DEEP_ENEMY_SPACE_WEIGHT;
+            score += (4 - enemy_exits).max(0) * DEEP_ENEMY_EXIT_WEIGHT;
+            score += (2 - enemy_escape).max(0) * DEEP_ENEMY_ESCAPE_WEIGHT;
+
+            if enemy_exits <= 1 && enemy_space <= 10 {
+                score += DEEP_ENEMY_TRAP_BONUS;
+            }
+        }
+    } else {
+        score += 100_000;
+    }
+
+    DeepEval {
+        score,
+        survival_plies: depth_from_root,
+        min_exits: exits,
+        min_escape_routes: escape_routes,
+        min_space: space,
+    }
 }
 
 fn evaluate_move(
@@ -2495,6 +3314,78 @@ mod tests {
             future_survival_score(&context, &projected, 100, target, true),
             0
         );
+    }
+
+    #[test]
+    fn deep_prediction_reaches_multiple_alternating_plies() {
+        let me = snake("me", 100, &[(1, 1), (1, 0), (0, 0)]);
+        let enemy = snake("enemy", 100, &[(8, 8), (8, 9), (9, 9)]);
+        let board = board(11, 11, &[], &[], vec![snake("me", 100, &[(1, 1), (1, 0), (0, 0)]), enemy]);
+        let game = game("standard", None);
+        let candidate = evaluate_move(Direction::Up, &game, &board, &me)
+            .expect("up should be a legal candidate on an open board");
+
+        // The production search is intentionally time-bounded. This unit test
+        // needs a generous deterministic budget so it verifies the full
+        // multi-ply search rather than merely verifying the timeout fallback.
+        let prediction = deep_prediction_for_candidate_with_limits(
+            &game,
+            &board,
+            &me,
+            &candidate,
+            Instant::now() + Duration::from_secs(5),
+            DEEP_MAX_TEST_NODES,
+        );
+
+        assert!(prediction.nodes > 0);
+        assert!(!prediction.timed_out);
+        assert!(prediction.survival_plies >= DEEP_PLY);
+        assert!(prediction.min_exits >= 2);
+        assert!(prediction.min_escape_routes >= 1);
+    }
+
+    #[test]
+    fn deep_prediction_marks_a_forced_head_to_head_loss() {
+        let me = snake("me", 100, &[(0, 1), (0, 0)]);
+        let enemy = snake("enemy", 100, &[(2, 1), (2, 0), (3, 0), (3, 1)]);
+        let board = board(5, 5, &[], &[], vec![snake("me", 100, &[(0, 1), (0, 0)]), enemy]);
+        let game = game("standard", None);
+        let candidate = Candidate {
+            direction: Direction::Right,
+            score: 0,
+            health_after: 99,
+            space: 20,
+            exits: 3,
+            eating: false,
+            territory: 10,
+            forced_kill: false,
+            future_survival: 10_000,
+            trap_risk: 0,
+            enemy_pressure: 0,
+            adversarial_space: 20,
+            future_space: 100,
+            worst_case_space: 20,
+            worst_case_exits: 3,
+            escape_routes: 2,
+            future_worst_exits: 3,
+            future_escape_routes: 2,
+            enemy_cutoff_risk: 0,
+            enemy_push_risk: 0,
+            edge_exposure_risk: 0,
+            commitment_risk: 0,
+            loses_head_to_head: false,
+        };
+
+        let prediction = deep_prediction_for_candidate(
+            &game,
+            &board,
+            &me,
+            &candidate,
+            Instant::now() + Duration::from_millis(250),
+        );
+
+        assert!(prediction.score <= DEEP_LOSS_SCORE + DEEP_PLY as i64);
+        assert!(prediction.survival_plies <= 1);
     }
 
     #[test]

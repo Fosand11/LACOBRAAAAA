@@ -5,6 +5,12 @@
 //! engine spends its move budget across all root choices instead of timing out
 //! on the first branch it explores.
 //!
+//! V2.10-Mega strengthens food growth priority, structural anti-cornering, and
+//! short-horizon escape quality on top of the V2.8/Food engine.
+//!
+//! V2.11-Competitive adds growth pressure when shorter than rivals, a dynamic
+//! anti-cerco exit floor, stronger edge pressure, and two-ply escape scoring.
+//!
 //! V2.8-Food adds starvation-aware route planning: once health starts trending
 //! toward the danger zone, the engine explicitly prefers moves that make real
 //! progress toward reachable food instead of treating food as a small score
@@ -131,6 +137,14 @@ const DEEP_SAFE_NEAR_EDGE_DISTANCE: i64 = 2;
 // corridor from winning solely on raw space/territory when another route exists.
 const CORRIDOR_TREND_DANGER: i64 = 6;
 const CORRIDOR_TREND_CRITICAL: i64 = 4;
+const STRUCTURAL_FUNNEL_DROP_PERCENT: i64 = 35;
+const STRUCTURAL_FUNNEL_FUTURE_EXITS: i64 = 2;
+const STRUCTURAL_CERCO_PUSH: i64 = 650;
+const STRUCTURAL_CERCO_CUTOFF: i64 = 800;
+const STRUCTURAL_COMMITMENT: i64 = 1_800;
+const DEEP_DYNAMIC_MIN_EXITS: i64 = 3;
+const FOOD_GROWTH_PRIORITY_GAP: i32 = 1;
+const FOOD_GROWTH_PRIORITY_BONUS: i64 = 180_000;
 
 const DEEP_LOSS_SCORE: i64 = -1_000_000_000;
 const DEEP_WIN_SCORE: i64 = 1_000_000_000;
@@ -152,9 +166,13 @@ const DEEP_ENEMY_BOX_BONUS: i64 = 45_000;
 
 const FOOD_RESCUE_HEALTH: i32 = 35;
 const FOOD_RESCUE_WEIGHT: i64 = 180;
-const FOOD_HUNT_TRIGGER: i32 = 60;
+const FOOD_HUNT_TRIGGER: i32 = 90;
+const FOOD_FORCE_HEALTH: i32 = 45;
+const FOOD_OPPORTUNITY_HEALTH: i32 = 100;
+const FOOD_SAFE_MAX_DISTANCE: i32 = 9;
 const FOOD_ROUTE_MARGIN: i32 = 4;
 const FOOD_ROUTE_BONUS: i64 = 60_000;
+const FOOD_HARD_PRIORITY_BONUS: i64 = 260_000;
 const FOOD_ROUTE_DISTANCE_WEIGHT: i64 = 7_500;
 const FOOD_ROUTE_URGENCY_WEIGHT: i64 = 4_500;
 const FOOD_ROUTE_LATE_PENALTY: i64 = 125_000;
@@ -392,10 +410,74 @@ fn candidate_food_priority(candidate: &Candidate) -> bool {
     candidate.eating || candidate.food_distance.is_some()
 }
 
-fn prefer_food_routes<'a>(
-    pool: Vec<&'a Candidate>,
-    health: i32,
-) -> (Vec<&'a Candidate>, bool) {
+fn food_survival_candidate(candidate: &Candidate, health: i32) -> bool {
+    if candidate.loses_head_to_head || candidate.forced_kill {
+        return false;
+    }
+
+    if candidate.eating {
+        return true;
+    }
+
+    if health > FOOD_HUNT_TRIGGER {
+        return false;
+    }
+
+    let Some(distance) = candidate.food_distance else {
+        return false;
+    };
+
+    // At low health, a short route to food is a survival plan, even if a
+    // one-ply corridor metric temporarily dislikes the destination. The route
+    // still needs at least one genuine continuation.
+    candidate.food_viable
+        || (distance <= FOOD_SAFE_MAX_DISTANCE
+            && candidate.exits >= 1
+            && candidate.future_survival > 0)
+        || (health <= FOOD_FORCE_HEALTH
+            && distance <= health.saturating_sub(1)
+            && candidate.future_survival > 0)
+}
+
+fn food_growth_priority(candidate: &Candidate, you: &Battlesnake, board: &Board, wraps: bool) -> i64 {
+    if candidate.loses_head_to_head || candidate.food_is_contested {
+        return 0;
+    }
+
+    let my_len = snake_length(you);
+    let largest_enemy = board
+        .snakes
+        .iter()
+        .filter(|snake| snake.id != you.id)
+        .map(snake_length)
+        .max()
+        .unwrap_or(my_len);
+    let length_gap = largest_enemy - my_len;
+
+    let Some(distance) = candidate.food_distance else {
+        return 0;
+    };
+
+    let safe_geometry = candidate.exits >= 2
+        && candidate.future_survival > 0
+        && !is_structural_cerco_risk(candidate, you, board, wraps);
+    if !safe_geometry {
+        return 0;
+    }
+
+    if candidate.eating && length_gap >= FOOD_GROWTH_PRIORITY_GAP {
+        return FOOD_GROWTH_PRIORITY_BONUS + (length_gap as i64).min(8) * 20_000;
+    }
+
+    if length_gap >= FOOD_GROWTH_PRIORITY_GAP && distance <= FOOD_SAFE_MAX_DISTANCE {
+        return (FOOD_GROWTH_PRIORITY_BONUS / 2)
+            + ((FOOD_SAFE_MAX_DISTANCE - distance + 1).max(0) as i64 * 8_000);
+    }
+
+    0
+}
+
+fn prefer_food_routes<'a>(pool: Vec<&'a Candidate>, health: i32) -> (Vec<&'a Candidate>, bool) {
     if health > FOOD_HUNT_TRIGGER {
         return (pool, false);
     }
@@ -405,18 +487,10 @@ fn prefer_food_routes<'a>(
         .copied()
         .filter(|candidate| candidate_food_priority(candidate))
         .collect();
-
     if routed.is_empty() {
         return (pool, false);
     }
 
-    // V2.9.2: when health is already in rescue territory, an immediately
-    // consumable food tile is a stronger survival signal than merely having a
-    // route that reaches food in a few turns. Otherwise the deep search can
-    // prefer a wider non-eating move because it temporarily preserves more
-    // space, even though the snake is already spending its last health points.
-    // Keep forced-kill handling outside this helper so tactical H2H decisions
-    // still go through the normal strategic filters.
     if health <= FOOD_RESCUE_HEALTH {
         let immediate_food: Vec<&Candidate> = routed
             .iter()
@@ -428,20 +502,47 @@ fn prefer_food_routes<'a>(
         }
     }
 
-    // Prefer routes that have enough health margin to reach food. When no such
-    // route exists, keep the nearest-food candidates anyway: at that point the
-    // search is already in starvation mode and making progress toward food is
-    // preferable to spending another turn on a wide but finite loop.
-    let viable: Vec<&Candidate> = routed
+    let hard_food: Vec<&Candidate> = routed
         .iter()
         .copied()
-        .filter(|candidate| candidate.eating || candidate.food_viable)
+        .filter(|candidate| food_survival_candidate(candidate, health))
+        .collect();
+    if !hard_food.is_empty() {
+        return (hard_food, true);
+    }
+
+    let reachable_safe: Vec<&Candidate> = routed
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !candidate.food_is_contested
+                && candidate.food_distance.is_some_and(|distance| distance <= FOOD_SAFE_MAX_DISTANCE)
+                && candidate.future_survival > 0
+                && candidate.exits >= 2
+        })
+        .collect();
+    if !reachable_safe.is_empty() {
+        return (reachable_safe, true);
+    }
+
+    if health > FOOD_FORCE_HEALTH {
+        return (pool, false);
+    }
+
+    let desperate: Vec<&Candidate> = routed
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate.food_distance.is_some()
+                && candidate.future_survival > 0
+                && (candidate.exits >= 1 || candidate.eating)
+        })
         .collect();
 
-    if viable.is_empty() {
-        (routed, true)
+    if desperate.is_empty() {
+        (pool, false)
     } else {
-        (viable, true)
+        (desperate, true)
     }
 }
 
@@ -503,7 +604,10 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
     let future_viable: Vec<&Candidate> = pool
         .iter()
         .copied()
-        .filter(|candidate| candidate.future_survival > 0)
+        .filter(|candidate| {
+            candidate.future_survival > 0
+                || food_survival_candidate(candidate, you.health)
+        })
         .collect();
     let pool = if future_viable.is_empty() {
         pool
@@ -516,6 +620,17 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
     // normal open-space filters so a larger-but-starving corridor cannot hide
     // a reachable food path. The regular safety filters still run afterward.
     let (pool, food_hunt_active) = prefer_food_routes(pool, you.health);
+
+    let growth_food_candidates: Vec<&Candidate> = pool
+        .iter()
+        .copied()
+        .filter(|candidate| food_growth_priority(candidate, you, board, is_wrapped(game)) > 0)
+        .collect();
+    let pool = if food_hunt_active || growth_food_candidates.is_empty() {
+        pool
+    } else {
+        growth_food_candidates
+    };
 
     // Do not trade a healthy escape route for a locally attractive corridor.
     // Keep the mobility floor as a preference, not an absolute rule: when
@@ -618,7 +733,11 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
     let strategic_safe: Vec<&Candidate> = pool
         .iter()
         .copied()
-        .filter(|candidate| candidate.forced_kill || !is_cerco_risk(candidate))
+        .filter(|candidate| {
+            candidate.forced_kill
+                || !is_cerco_risk(candidate)
+                || (food_hunt_active && food_survival_candidate(candidate, you.health))
+        })
         .collect();
     let pool = if strategic_safe.is_empty() {
         pool
@@ -637,6 +756,7 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
         .filter(|candidate| {
             candidate.forced_kill
                 || candidate.eating
+                || (food_hunt_active && food_survival_candidate(candidate, you.health))
                 || !is_anti_funnel_risk(candidate, you, board, is_wrapped(game))
         })
         .collect();
@@ -645,6 +765,26 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
     } else {
         anti_funnel_safe
     };
+
+    // Immediate survival action: if food is on the next square and we are in
+    // the force zone, do not spend hundreds of milliseconds re-proving what is
+    // already the obvious resource decision. This also guarantees that the
+    // deep search cannot accidentally trade an eating move for a prettier
+    // geometric line after a timeout.
+    if you.health <= FOOD_FORCE_HEALTH {
+        let immediate_food: Vec<&Candidate> = pool
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                candidate.eating
+                    && !candidate.loses_head_to_head
+                    && candidate.future_survival > 0
+            })
+            .collect();
+        if immediate_food.len() == 1 {
+            return finish_selection(game, immediate_food);
+        }
+    }
 
     // V2.8: give the deep engine a fresh budget after the shallow legality and
     // strategy filters have finished. This avoids the old fixed-from-request
@@ -673,6 +813,21 @@ fn deep_candidate_required_escape(
     }
 }
 
+fn deep_candidate_required_exits(root_candidate: &Candidate, you: &Battlesnake, board: &Board) -> i64 {
+    let head = Point::from(&you.head);
+    let target = root_candidate.direction.next(head, board, false).unwrap_or(head);
+    let edge = boundary_distance(target, board);
+    if edge <= DEEP_SAFE_NEAR_EDGE_DISTANCE
+        && (root_candidate.enemy_push_risk >= STRUCTURAL_CERCO_PUSH
+            || root_candidate.enemy_cutoff_risk >= STRUCTURAL_CERCO_CUTOFF
+            || root_candidate.commitment_risk >= STRUCTURAL_COMMITMENT)
+    {
+        DEEP_DYNAMIC_MIN_EXITS
+    } else {
+        DEEP_SAFE_MIN_EXITS
+    }
+}
+
 fn deep_candidate_is_safe(
     prediction: &DeepPrediction,
     root_candidate: &Candidate,
@@ -682,7 +837,7 @@ fn deep_candidate_is_safe(
     completed_depth: usize,
 ) -> bool {
     prediction.survival_plies >= completed_depth
-        && prediction.min_exits >= DEEP_SAFE_MIN_EXITS
+        && prediction.min_exits >= deep_candidate_required_exits(root_candidate, you, board)
         && prediction.min_escape_routes
             >= deep_candidate_required_escape(root_candidate, you, board, wraps)
 }
@@ -715,7 +870,58 @@ fn is_anti_funnel_risk(
         && space_is_shrinking
         && (candidate.exits <= 2 || candidate.future_worst_exits <= 2);
 
-    strong_trend || critical_trend
+    strong_trend || critical_trend || is_structural_cerco_risk(candidate, you, board, wraps)
+}
+
+fn is_structural_cerco_risk(candidate: &Candidate, you: &Battlesnake, board: &Board, wraps: bool) -> bool {
+    if wraps {
+        return false;
+    }
+    let head = Point::from(&you.head);
+    let target = candidate.direction.next(head, board, false).unwrap_or(head);
+    let edge = boundary_distance(target, board);
+
+    let push_or_cutoff = candidate.enemy_push_risk >= STRUCTURAL_CERCO_PUSH
+        || candidate.enemy_cutoff_risk >= STRUCTURAL_CERCO_CUTOFF
+        || candidate.commitment_risk >= STRUCTURAL_COMMITMENT;
+    let mobility_collapse = candidate.future_worst_exits <= STRUCTURAL_FUNNEL_FUTURE_EXITS
+        && candidate.future_escape_routes <= 1;
+    let severe_drop = candidate.space > 0
+        && candidate.future_space.max(0) * 100
+            <= candidate.space.saturating_mul(100 - STRUCTURAL_FUNNEL_DROP_PERCENT as usize) as i64;
+    let projected_one_exit = candidate.future_worst_exits <= 1;
+    let severe_enemy_closure = candidate.enemy_push_risk >= STRUCTURAL_CERCO_PUSH
+        && candidate.enemy_cutoff_risk >= STRUCTURAL_CERCO_CUTOFF / 2;
+    let trend_collapse = candidate.corridor_trend >= CORRIDOR_TREND_DANGER
+        && (severe_drop || mobility_collapse);
+
+    (edge <= DEEP_SAFE_NEAR_EDGE_DISTANCE
+        && ((severe_drop && (mobility_collapse || push_or_cutoff)) || trend_collapse))
+        || (candidate.exits <= 2 && mobility_collapse && push_or_cutoff)
+        || (edge <= 1 && projected_one_exit && severe_enemy_closure)
+}
+
+fn food_deep_priority(candidate: &Candidate, you: &Battlesnake, board: &Board, wraps: bool) -> i64 {
+    if candidate.loses_head_to_head || candidate.food_is_contested {
+        return 0;
+    }
+    let mut priority = 0_i64;
+    if candidate.eating {
+        priority += 3_000_000;
+    }
+    if let Some(distance) = candidate.food_distance {
+        if distance <= FOOD_SAFE_MAX_DISTANCE {
+            priority += (FOOD_SAFE_MAX_DISTANCE - distance + 1) as i64 * 120_000;
+        }
+        if candidate.food_viable {
+            priority += 1_500_000;
+        }
+    }
+    priority += food_growth_priority(candidate, you, board, wraps);
+    if you.health <= FOOD_FORCE_HEALTH && candidate.eating {
+        priority += 2_000_000;
+    }
+    priority
 }
 
 fn prefer_future_escape<'a>(pool: Vec<&'a Candidate>) -> Vec<&'a Candidate> {
@@ -744,7 +950,7 @@ fn finish_selection(game: &Game, pool: Vec<&Candidate>) -> Direction {
         }
     }
     info!(
-        "MOVE_DECISION id={} direction={} score={} health_after={} space={} territory={} exits={} eating={} food_distance={:?} food_contested={} food_viable={} forced_kill={} h2h_risk={} future={} trap={} pressure={} adversarial_space={} future_space={} corridor_trend={} worst_space={} worst_exits={} escape_routes={} future_worst_exits={} future_escape_routes={} cutoff={} push={} edge_risk={} commitment={}",
+        "MOVE_DECISION id={} direction={} score={} health_after={} space={} territory={} exits={} eating={} food_distance={:?} food_contested={} food_viable={} food_survival={} forced_kill={} h2h_risk={} future={} trap={} pressure={} adversarial_space={} future_space={} corridor_trend={} worst_space={} worst_exits={} escape_routes={} future_worst_exits={} future_escape_routes={} cutoff={} push={} edge_risk={} commitment={}",
         game.id,
         best.direction.name(),
         best.score,
@@ -756,6 +962,7 @@ fn finish_selection(game: &Game, pool: Vec<&Candidate>) -> Direction {
         best.food_distance,
         best.food_is_contested,
         best.food_viable,
+        food_survival_candidate(best, best.health_after),
         best.forced_kill,
         best.loses_head_to_head,
         best.future_survival,
@@ -969,9 +1176,12 @@ fn deep_select_direction(
             is_wrapped(game),
             completed_depth,
         );
+        let candidate_food_key = food_deep_priority(pool[index], you, board, is_wrapped(game));
+        let best_food_key = food_deep_priority(pool[best_index], you, board, is_wrapped(game));
 
         let candidate_key = (
             candidate_safe,
+            candidate_food_key,
             candidate.min_escape_routes,
             candidate.min_exits,
             -(candidate.min_enemy_escape),
@@ -982,6 +1192,7 @@ fn deep_select_direction(
         );
         let best_key = (
             best_safe,
+            best_food_key,
             best.min_escape_routes,
             best.min_exits,
             -(best.min_enemy_escape),
@@ -1861,6 +2072,28 @@ fn deep_quick_state_score(
     };
 
     let food_pressure = deep_food_pressure(board, state, food, dangerous, wraps);
+    let food_distance = deep_nearest_food_distance(board, state, food, dangerous, wraps);
+    let mut food_priority = 0_i64;
+    if state.our_health <= FOOD_OPPORTUNITY_HEALTH {
+        if let Some(distance) = food_distance {
+            if distance <= FOOD_SAFE_MAX_DISTANCE {
+                food_priority += (FOOD_SAFE_MAX_DISTANCE - distance + 1) as i64 * 110_000;
+            }
+            if state.our_health <= FOOD_FORCE_HEALTH {
+                food_priority += 400_000;
+            }
+        } else if state.our_health <= FOOD_RESCUE_HEALTH {
+            food_priority -= 500_000;
+        }
+    }
+    if state.enemy_alive {
+        let growth_gap = (state.enemy_body.len() as i32 - state.our_body.len() as i32).max(0);
+        if growth_gap >= FOOD_GROWTH_PRIORITY_GAP
+            && food_distance.is_some_and(|distance| distance <= FOOD_SAFE_MAX_DISTANCE)
+        {
+            food_priority += FOOD_GROWTH_PRIORITY_BONUS;
+        }
+    }
 
     exits * 18_000
         + escape * 16_000
@@ -1869,6 +2102,7 @@ fn deep_quick_state_score(
         - enemy_distance * 300
         + offensive
         + food_pressure
+        + food_priority
         + if state.enemy_alive { 0 } else { 100_000 }
 }
 
@@ -1976,13 +2210,32 @@ fn deep_eval_state(
     let (space, _) = reachable_space(board, state.our_body[0], &blocked, dangerous, wraps);
     let edge = boundary_distance(state.our_body[0], board);
     let (enemy_space, enemy_exits, enemy_escape) = deep_enemy_mobility(board, state, wraps);
-    let _food_pressure = deep_food_pressure(board, state, food, dangerous, wraps);
+    let food_distance = deep_nearest_food_distance(board, state, food, dangerous, wraps);
+    let food_pressure = deep_food_pressure(board, state, food, dangerous, wraps);
 
     let mut score = space as i64 * 320
         + exits * 18_000
         + escape_routes * 16_000
         + edge * 700
-        + state.our_health as i64 * 25;
+        + state.our_health as i64 * 25
+        + food_pressure;
+
+    if let Some(distance) = food_distance {
+        if state.our_health <= FOOD_OPPORTUNITY_HEALTH && distance <= FOOD_SAFE_MAX_DISTANCE {
+            score += (FOOD_SAFE_MAX_DISTANCE - distance + 1) as i64 * 100_000;
+        }
+    } else if state.our_health <= FOOD_RESCUE_HEALTH {
+        score -= 450_000;
+    }
+
+    if state.enemy_alive {
+        let growth_gap = (state.enemy_body.len() as i32 - state.our_body.len() as i32).max(0);
+        if growth_gap >= FOOD_GROWTH_PRIORITY_GAP
+            && food_distance.is_some_and(|distance| distance <= FOOD_SAFE_MAX_DISTANCE)
+        {
+            score += FOOD_GROWTH_PRIORITY_BONUS;
+        }
+    }
 
     if exits <= 1 {
         score -= 45_000;
@@ -2050,6 +2303,56 @@ fn deep_eval_state(
         min_enemy_exits: enemy_exits,
         min_enemy_escape: enemy_escape,
     }
+}
+
+fn two_ply_escape_quality(
+    board: &Board,
+    start: Point,
+    blocked: &HashSet<Point>,
+    dangerous: &HashSet<Point>,
+    wraps: bool,
+) -> (i64, usize) {
+    let mut best_min_exits = 0_i64;
+    let mut best_space = 0_usize;
+
+    for first_direction in DIRECTIONS.iter().copied() {
+        let Some(first) = first_direction.next(start, board, wraps) else {
+            continue;
+        };
+        if blocked.contains(&first) || dangerous.contains(&first) {
+            continue;
+        }
+
+        let first_exits = count_escape_exits(board, first, blocked, dangerous, wraps) as i64;
+        let mut found_second = false;
+
+        for second_direction in DIRECTIONS.iter().copied() {
+            let Some(second) = second_direction.next(first, board, wraps) else {
+                continue;
+            };
+            if second == start || blocked.contains(&second) || dangerous.contains(&second) {
+                continue;
+            }
+
+            let second_exits = count_escape_exits(board, second, blocked, dangerous, wraps) as i64;
+            let min_exits = first_exits.min(second_exits);
+            let mut second_blocked = blocked.clone();
+            second_blocked.remove(&first);
+            let (space, _) = reachable_space(board, second, &second_blocked, dangerous, wraps);
+
+            if !found_second || (min_exits, space) > (best_min_exits, best_space) {
+                best_min_exits = min_exits;
+                best_space = space;
+                found_second = true;
+            }
+        }
+
+        if !found_second && first_exits > best_min_exits {
+            best_min_exits = first_exits;
+        }
+    }
+
+    (best_min_exits, best_space)
 }
 
 fn evaluate_move(
@@ -2216,6 +2519,13 @@ fn evaluate_move(
         wraps,
         projected_body.len(),
     );
+    let (two_ply_exits, two_ply_space) = two_ply_escape_quality(
+        board,
+        target,
+        &planning_blocked,
+        &dangerous,
+        wraps,
+    );
 
     // V2.9: catch a corridor that is closing over several turns while we hug
     // a wall, before the 1-ply adversarial checks below would notice.
@@ -2244,6 +2554,13 @@ fn evaluate_move(
     score -= enemy_pressure * ENEMY_PRESSURE_WEIGHT;
     score += adversarial_space as i64 * ADVERSARIAL_SPACE_WEIGHT;
     score += future_space * FUTURE_SPACE_WEIGHT;
+    score += two_ply_exits * 3_000;
+    score += (two_ply_space.min(200) as i64) * 10;
+    if two_ply_exits <= 1 {
+        score -= 45_000;
+    } else if two_ply_exits == 2 {
+        score -= 8_000;
+    }
     score -= corridor_trend * CORRIDOR_TREND_WEIGHT;
 
     // V2.2 anti-corner scoring. A move is only truly good if it keeps an
@@ -2288,6 +2605,21 @@ fn evaluate_move(
         eating,
         constrictor,
     );
+
+    // Even before starvation mode, nearby uncontested food should not be
+    // treated as something to accidentally dodge. This is deliberately capped
+    // so safe geometry still matters when the food is far away.
+    if !constrictor && !food_is_contested {
+        if let Some(distance) = food_distance {
+            if distance <= FOOD_SAFE_MAX_DISTANCE && you.health <= FOOD_OPPORTUNITY_HEALTH {
+                let proximity = (FOOD_SAFE_MAX_DISTANCE - distance + 1).max(0) as i64;
+                score += proximity * 2_500;
+                if health_after <= FOOD_HUNT_TRIGGER {
+                    score += FOOD_HARD_PRIORITY_BONUS;
+                }
+            }
+        }
+    }
 
     if eating {
         // Food is mainly valuable as fuel; growing without a health need is a
@@ -3490,8 +3822,12 @@ fn enemy_push_risk(
         .filter(|point| boundary_distance(*point, board) > boundary_distance(target, board))
         .count() as i64;
 
-    if boundary_distance(target, board) <= 1 && exits <= 2 && interior_escape == 0 {
-        risk += 850;
+    let edge = boundary_distance(target, board);
+    if edge <= 1 && exits <= 2 && interior_escape == 0 {
+        risk += 1_250;
+    }
+    if edge <= 1 && escape_routes <= 1 && distance <= PUSH_DISTANCE_THRESHOLD {
+        risk += 600;
     }
 
     risk
@@ -3526,7 +3862,8 @@ fn boundary_exposure_risk(
     }
 
     if push_risk > 0 && edge <= 2 {
-        risk += (3 - edge) * 180;
+        let proximity = (3 - edge).max(1);
+        risk += proximity * proximity * 220;
     }
 
     risk
@@ -4058,6 +4395,111 @@ mod tests {
         assert!(active);
         assert_eq!(preferred.len(), 1);
         assert_eq!(preferred[0].direction, Direction::Right);
+    }
+
+    #[test]
+    fn low_health_food_route_is_protected_from_generic_cerco_filter() {
+        let candidate = Candidate {
+            direction: Direction::Right,
+            score: -2_000_000,
+            health_after: 30,
+            space: 10,
+            exits: 1,
+            eating: false,
+            territory: 0,
+            forced_kill: false,
+            future_survival: 1_000,
+            trap_risk: 0,
+            enemy_pressure: 0,
+            adversarial_space: 10,
+            future_space: 10,
+            worst_case_space: 10,
+            worst_case_exits: 1,
+            escape_routes: 0,
+            future_worst_exits: 1,
+            future_escape_routes: 1,
+            enemy_cutoff_risk: 0,
+            enemy_push_risk: 5_000,
+            edge_exposure_risk: 1_500,
+            commitment_risk: 4_000,
+            corridor_trend: 0,
+            food_distance: Some(4),
+            food_is_contested: false,
+            food_viable: true,
+            loses_head_to_head: false,
+        };
+
+        assert!(food_survival_candidate(&candidate, 30));
+    }
+
+    #[test]
+    fn food_survival_candidate_counts_as_future_viable() {
+        let candidate = Candidate {
+            direction: Direction::Right,
+            score: -2_000_000,
+            health_after: 40,
+            space: 9,
+            exits: 1,
+            eating: false,
+            territory: 0,
+            forced_kill: false,
+            future_survival: 0,
+            trap_risk: 0,
+            enemy_pressure: 0,
+            adversarial_space: 9,
+            future_space: 9,
+            worst_case_space: 9,
+            worst_case_exits: 1,
+            escape_routes: 0,
+            future_worst_exits: 1,
+            future_escape_routes: 1,
+            enemy_cutoff_risk: 0,
+            enemy_push_risk: 0,
+            edge_exposure_risk: 0,
+            commitment_risk: 0,
+            corridor_trend: 0,
+            food_distance: Some(4),
+            food_is_contested: false,
+            food_viable: true,
+            loses_head_to_head: false,
+        };
+
+        assert!(food_survival_candidate(&candidate, 40));
+    }
+
+    #[test]
+    fn nearby_food_is_an_opportunity_before_starvation() {
+        let candidate = Candidate {
+            direction: Direction::Right,
+            score: 0,
+            health_after: 74,
+            space: 30,
+            exits: 2,
+            eating: false,
+            territory: 0,
+            forced_kill: false,
+            future_survival: 10_000,
+            trap_risk: 0,
+            enemy_pressure: 0,
+            adversarial_space: 30,
+            future_space: 30,
+            worst_case_space: 30,
+            worst_case_exits: 2,
+            escape_routes: 1,
+            future_worst_exits: 2,
+            future_escape_routes: 1,
+            enemy_cutoff_risk: 0,
+            enemy_push_risk: 0,
+            edge_exposure_risk: 0,
+            commitment_risk: 0,
+            corridor_trend: 0,
+            food_distance: Some(3),
+            food_is_contested: false,
+            food_viable: true,
+            loses_head_to_head: false,
+        };
+
+        assert!(food_survival_candidate(&candidate, 74));
     }
 
     #[test]
@@ -4779,4 +5221,41 @@ mod tests {
             Direction::Up
         );
     }
+
+    #[test]
+    fn structural_cerco_detects_shrinking_space_under_pressure() {
+        let me = snake("me", 80, &[(1, 5), (1, 4), (1, 3)]);
+        let board = board(7, 7, &[], &[], vec![snake("me", 80, &[(1, 5), (1, 4), (1, 3)])]);
+        let candidate = Candidate {
+            direction: Direction::Up,
+            score: 0,
+            health_after: 79,
+            space: 100,
+            exits: 2,
+            eating: false,
+            territory: 0,
+            forced_kill: false,
+            future_survival: 10_000,
+            trap_risk: 0,
+            enemy_pressure: 0,
+            adversarial_space: 50,
+            future_space: 50,
+            worst_case_space: 50,
+            worst_case_exits: 2,
+            escape_routes: 1,
+            future_worst_exits: 1,
+            future_escape_routes: 1,
+            enemy_cutoff_risk: 1_000,
+            enemy_push_risk: 800,
+            edge_exposure_risk: 0,
+            commitment_risk: 2_000,
+            corridor_trend: 0,
+            food_distance: None,
+            food_is_contested: false,
+            food_viable: false,
+            loses_head_to_head: false,
+        };
+        assert!(is_structural_cerco_risk(&candidate, &me, &board, false));
+    }
+
 }

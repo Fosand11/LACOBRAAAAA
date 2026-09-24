@@ -55,11 +55,16 @@ const TRAP_SPACE_THRESHOLD: i64 = 24;
 const TRAP_PENALTY_WEIGHT: i64 = 320;
 
 // V2 strategic weights. These sit below the hard survival filters.
-const TRAP_RISK_WEIGHT: i64 = 12;
+// V2.9: anti-cerco rebalance. These were small relative to SPACE_WEIGHT/
+// TERRITORY_WEIGHT, so a corridor that still looked "big" could keep
+// outscoring the growing risk of hugging a wall turn after turn (see the
+// V2.9 changelog note near ENEMY_PUSH_DANGER below for the replay this
+// fixes). Raised so corridor/edge risk actually competes with raw space.
+const TRAP_RISK_WEIGHT: i64 = 45;
 const ENEMY_PRESSURE_WEIGHT: i64 = 5;
 const ADVERSARIAL_SPACE_WEIGHT: i64 = 0;
 const ADVERSARIAL_COLLAPSE_WEIGHT: i64 = 700;
-const FUTURE_SPACE_WEIGHT: i64 = 14;
+const FUTURE_SPACE_WEIGHT: i64 = 22;
 const MIN_ADVERSARIAL_SPACE: usize = 10;
 const PRESSURE_DISTANCE: i32 = 5;
 const TRAP_LOOKAHEAD: i32 = 6;
@@ -74,7 +79,7 @@ const WORST_CASE_EXIT_WEIGHT: i64 = 1_150;
 const ESCAPE_ROUTE_WEIGHT: i64 = 240;
 const ENEMY_CUTOFF_WEIGHT: i64 = 18;
 const ENEMY_PUSH_WEIGHT: i64 = 14;
-const EDGE_EXPOSURE_WEIGHT: i64 = 11;
+const EDGE_EXPOSURE_WEIGHT: i64 = 40;
 const PUSH_DISTANCE_THRESHOLD: i64 = 8;
 
 // V2.3 strategic anti-cornering. We now look one enemy response and one
@@ -82,12 +87,20 @@ const PUSH_DISTANCE_THRESHOLD: i64 = 8;
 // the opponent can force our best continuation into a one-exit state or keep
 // us moving toward the boundary.
 const MIN_STRATEGIC_ESCAPE_ROUTES: i64 = 2;
-const ENEMY_PUSH_DANGER: i64 = 1_800;
-const ENEMY_CUTOFF_DANGER: i64 = 2_000;
-const EDGE_DANGER: i64 = 1_000;
+// V2.9: lowered from 1_800/2_000/1_000. Replay logs_1790211004739.json showed
+// the bot walking along the top wall for ~15 turns (space 78 -> 62 -> 10 -> 0)
+// before is_cerco_risk_values finally fired at commitment=8650 — by then every
+// candidate was already a losing one. These lower thresholds make the filter
+// trip while there is still a real alternative direction to take instead.
+const ENEMY_PUSH_DANGER: i64 = 1_200;
+const ENEMY_CUTOFF_DANGER: i64 = 1_400;
+const EDGE_DANGER: i64 = 700;
 const STRATEGIC_COMMITMENT_WEIGHT: i64 = 520;
 const STRATEGIC_ESCAPE_WEIGHT: i64 = 420;
 const FOOD_IN_CERCO_PENALTY: i64 = 18_000;
+// V2.9: commitment threshold used by is_cerco_risk_values. Was hardcoded as
+// 3_500 inline; pulled into a constant so it's tuned alongside the others.
+const COMMITMENT_DANGER: i64 = 2_400;
 
 // V2.4: future escape preservation. When at least one candidate leaves
 // a real escape route after the enemy response, prefer that pool over
@@ -106,7 +119,19 @@ const DEEP_MAX_TEST_NODES: u64 = 12_000_000;
 const DEEP_RESPONSE_RESERVE_MS: u128 = 65;
 const DEEP_ITER_DEPTHS: [usize; 5] = [4, 6, 8, 10, 12];
 const DEEP_SAFE_MIN_EXITS: i64 = 2;
+// V2.9.2: keep the normal escape floor at 1 in open space, but require two
+// enemy-resistant escape routes when the projected head is within two cells of
+// a hard boundary. This targets the wall-hugging failure mode from the replay.
 const DEEP_SAFE_MIN_ESCAPE: i64 = 1;
+const DEEP_SAFE_NEAR_EDGE_MIN_ESCAPE: i64 = 2;
+const DEEP_SAFE_NEAR_EDGE_DISTANCE: i64 = 2;
+
+// V2.9.2: structural anti-funnel thresholds. The scalar corridor penalty still
+// contributes to score, while this gate prevents a clearly shrinking edge
+// corridor from winning solely on raw space/territory when another route exists.
+const CORRIDOR_TREND_DANGER: i64 = 6;
+const CORRIDOR_TREND_CRITICAL: i64 = 4;
+
 const DEEP_LOSS_SCORE: i64 = -1_000_000_000;
 const DEEP_WIN_SCORE: i64 = 1_000_000_000;
 
@@ -221,6 +246,7 @@ struct Candidate {
     enemy_push_risk: i64,
     edge_exposure_risk: i64,
     commitment_risk: i64,
+    corridor_trend: i64,
     food_distance: Option<i32>,
     food_is_contested: bool,
     food_viable: bool,
@@ -382,6 +408,24 @@ fn prefer_food_routes<'a>(
 
     if routed.is_empty() {
         return (pool, false);
+    }
+
+    // V2.9.2: when health is already in rescue territory, an immediately
+    // consumable food tile is a stronger survival signal than merely having a
+    // route that reaches food in a few turns. Otherwise the deep search can
+    // prefer a wider non-eating move because it temporarily preserves more
+    // space, even though the snake is already spending its last health points.
+    // Keep forced-kill handling outside this helper so tactical H2H decisions
+    // still go through the normal strategic filters.
+    if health <= FOOD_RESCUE_HEALTH {
+        let immediate_food: Vec<&Candidate> = routed
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.eating && !candidate.loses_head_to_head)
+            .collect();
+        if !immediate_food.is_empty() {
+            return (immediate_food, true);
+        }
     }
 
     // Prefer routes that have enough health margin to reach food. When no such
@@ -582,6 +626,26 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
         strategic_safe
     };
 
+    // V2.9.2: structural anti-funnel gate. When the head is close to a boundary,
+    // a multi-layer shrinking corridor is treated as a pattern, not just another
+    // score penalty. If at least one alternative avoids the pattern, remove the
+    // funnel candidates from the pool. Immediate food and forced-kill moves stay
+    // available because they can be legitimate tactical exceptions.
+    let anti_funnel_safe: Vec<&Candidate> = pool
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate.forced_kill
+                || candidate.eating
+                || !is_anti_funnel_risk(candidate, you, board, is_wrapped(game))
+        })
+        .collect();
+    let pool = if anti_funnel_safe.is_empty() {
+        pool
+    } else {
+        anti_funnel_safe
+    };
+
     // V2.8: give the deep engine a fresh budget after the shallow legality and
     // strategy filters have finished. This avoids the old fixed-from-request
     // deadline that frequently left only ~410 ms for one candidate and caused
@@ -591,6 +655,67 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
     let deep_deadline = Instant::now() + Duration::from_millis(deep_budget_ms as u64);
     deep_select_direction(game, board, you, pool, deep_deadline)
 
+}
+
+fn deep_candidate_required_escape(
+    root_candidate: &Candidate,
+    you: &Battlesnake,
+    board: &Board,
+    wraps: bool,
+) -> i64 {
+    let head = Point::from(&you.head);
+    let target = root_candidate.direction.next(head, board, wraps).unwrap_or(head);
+
+    if !wraps && boundary_distance(target, board) <= DEEP_SAFE_NEAR_EDGE_DISTANCE {
+        DEEP_SAFE_NEAR_EDGE_MIN_ESCAPE
+    } else {
+        DEEP_SAFE_MIN_ESCAPE
+    }
+}
+
+fn deep_candidate_is_safe(
+    prediction: &DeepPrediction,
+    root_candidate: &Candidate,
+    you: &Battlesnake,
+    board: &Board,
+    wraps: bool,
+    completed_depth: usize,
+) -> bool {
+    prediction.survival_plies >= completed_depth
+        && prediction.min_exits >= DEEP_SAFE_MIN_EXITS
+        && prediction.min_escape_routes
+            >= deep_candidate_required_escape(root_candidate, you, board, wraps)
+}
+
+fn is_anti_funnel_risk(
+    candidate: &Candidate,
+    you: &Battlesnake,
+    board: &Board,
+    wraps: bool,
+) -> bool {
+    if wraps {
+        return false;
+    }
+
+    let head = Point::from(&you.head);
+    let target = candidate.direction.next(head, board, false).unwrap_or(head);
+    let edge = boundary_distance(target, board);
+    if edge > DEEP_SAFE_NEAR_EDGE_DISTANCE {
+        return false;
+    }
+
+    let space_is_shrinking = candidate.future_space < candidate.space as i64;
+    let future_mobility_tight = candidate.future_worst_exits <= 2
+        || candidate.future_escape_routes <= 1;
+
+    let strong_trend = candidate.corridor_trend >= CORRIDOR_TREND_DANGER
+        && (space_is_shrinking || future_mobility_tight);
+    let critical_trend = edge <= 1
+        && candidate.corridor_trend >= CORRIDOR_TREND_CRITICAL
+        && space_is_shrinking
+        && (candidate.exits <= 2 || candidate.future_worst_exits <= 2);
+
+    strong_trend || critical_trend
 }
 
 fn prefer_future_escape<'a>(pool: Vec<&'a Candidate>) -> Vec<&'a Candidate> {
@@ -619,7 +744,7 @@ fn finish_selection(game: &Game, pool: Vec<&Candidate>) -> Direction {
         }
     }
     info!(
-        "MOVE_DECISION id={} direction={} score={} health_after={} space={} territory={} exits={} eating={} food_distance={:?} food_contested={} food_viable={} forced_kill={} h2h_risk={} future={} trap={} pressure={} adversarial_space={} future_space={} worst_space={} worst_exits={} escape_routes={} future_worst_exits={} future_escape_routes={} cutoff={} push={} edge_risk={} commitment={}",
+        "MOVE_DECISION id={} direction={} score={} health_after={} space={} territory={} exits={} eating={} food_distance={:?} food_contested={} food_viable={} forced_kill={} h2h_risk={} future={} trap={} pressure={} adversarial_space={} future_space={} corridor_trend={} worst_space={} worst_exits={} escape_routes={} future_worst_exits={} future_escape_routes={} cutoff={} push={} edge_risk={} commitment={}",
         game.id,
         best.direction.name(),
         best.score,
@@ -638,6 +763,7 @@ fn finish_selection(game: &Game, pool: Vec<&Candidate>) -> Direction {
         best.enemy_pressure,
         best.adversarial_space,
         best.future_space,
+        best.corridor_trend,
         best.worst_case_space,
         best.worst_case_exits,
         best.escape_routes,
@@ -827,12 +953,22 @@ fn deep_select_direction(
         let candidate = &completed_predictions[index];
         let best = &completed_predictions[best_index];
 
-        let candidate_safe = candidate.survival_plies >= completed_depth
-            && candidate.min_exits >= DEEP_SAFE_MIN_EXITS
-            && candidate.min_escape_routes >= DEEP_SAFE_MIN_ESCAPE;
-        let best_safe = best.survival_plies >= completed_depth
-            && best.min_exits >= DEEP_SAFE_MIN_EXITS
-            && best.min_escape_routes >= DEEP_SAFE_MIN_ESCAPE;
+        let candidate_safe = deep_candidate_is_safe(
+            candidate,
+            pool[index],
+            you,
+            board,
+            is_wrapped(game),
+            completed_depth,
+        );
+        let best_safe = deep_candidate_is_safe(
+            best,
+            pool[best_index],
+            you,
+            board,
+            is_wrapped(game),
+            completed_depth,
+        );
 
         let candidate_key = (
             candidate_safe,
@@ -862,10 +998,14 @@ fn deep_select_direction(
 
     let chosen_candidate = pool[best_index];
     let chosen = completed_predictions[best_index];
-    let mode = if chosen.survival_plies >= completed_depth
-        && chosen.min_exits >= DEEP_SAFE_MIN_EXITS
-        && chosen.min_escape_routes >= DEEP_SAFE_MIN_ESCAPE
-    {
+    let mode = if deep_candidate_is_safe(
+        &chosen,
+        chosen_candidate,
+        you,
+        board,
+        is_wrapped(game),
+        completed_depth,
+    ) {
         "iterative_safe"
     } else {
         "iterative_deepest"
@@ -1836,7 +1976,7 @@ fn deep_eval_state(
     let (space, _) = reachable_space(board, state.our_body[0], &blocked, dangerous, wraps);
     let edge = boundary_distance(state.our_body[0], board);
     let (enemy_space, enemy_exits, enemy_escape) = deep_enemy_mobility(board, state, wraps);
-    let food_pressure = deep_food_pressure(board, state, food, dangerous, wraps);
+    let _food_pressure = deep_food_pressure(board, state, food, dangerous, wraps);
 
     let mut score = space as i64 * 320
         + exits * 18_000
@@ -2077,6 +2217,10 @@ fn evaluate_move(
         projected_body.len(),
     );
 
+    // V2.9: catch a corridor that is closing over several turns while we hug
+    // a wall, before the 1-ply adversarial checks below would notice.
+    let corridor_trend = corridor_trend_risk(board, target, &distances, wraps);
+
     let attack_context = AttackContext {
         game,
         board,
@@ -2100,6 +2244,7 @@ fn evaluate_move(
     score -= enemy_pressure * ENEMY_PRESSURE_WEIGHT;
     score += adversarial_space as i64 * ADVERSARIAL_SPACE_WEIGHT;
     score += future_space * FUTURE_SPACE_WEIGHT;
+    score -= corridor_trend * CORRIDOR_TREND_WEIGHT;
 
     // V2.2 anti-corner scoring. A move is only truly good if it keeps an
     // escape after the opponent gets the next move.
@@ -2194,6 +2339,7 @@ fn evaluate_move(
         enemy_push_risk: adversarial.enemy_push_risk,
         edge_exposure_risk: adversarial.edge_exposure_risk,
         commitment_risk: adversarial.commitment_risk,
+        corridor_trend,
         food_distance,
         food_is_contested,
         food_viable: food_distance.is_some_and(|distance| {
@@ -3187,7 +3333,7 @@ fn is_cerco_risk_values(analysis: &AdversarialAnalysis) -> bool {
         return true;
     }
 
-    analysis.commitment_risk >= 3_500
+    analysis.commitment_risk >= COMMITMENT_DANGER
 }
 
 fn legal_enemy_projection(
@@ -3407,6 +3553,67 @@ fn topology_distance(a: Point, b: Point, board: &Board, wraps: bool) -> i64 {
     } else {
         dx + dy
     }
+}
+
+// V2.9: weight for the shrinking-corridor detector below.
+const CORRIDOR_TREND_WEIGHT: i64 = 260;
+
+/// Detect a corridor that keeps narrowing while we are near a wall.
+///
+/// `future_space_score` already penalizes a frontier that collapses to zero,
+/// but only lightly, and only right at the point it hits zero. The replay in
+/// `logs_1790211004739.json` showed the real failure mode: reachable space
+/// shrinking turn after turn (78 -> 72 -> 70 -> 62 -> 10 -> ... -> 0) while
+/// the head stayed pinned to the top wall the whole time. Each individual
+/// turn still looked "safe enough" (2+ exits), so nothing flagged it until
+/// the corridor was already closed. This looks at the BFS frontier layers
+/// directly: if the frontier is monotonically shrinking for several layers in
+/// a row *and* we are hugging a boundary, that is treated as an early warning
+/// independent of the absolute space/exit counts.
+fn corridor_trend_risk(
+    board: &Board,
+    target: Point,
+    distances: &HashMap<Point, i32>,
+    wraps: bool,
+) -> i64 {
+    if wraps {
+        return 0;
+    }
+
+    let edge = boundary_distance(target, board);
+    if edge > 2 {
+        return 0;
+    }
+
+    let mut frontier = [0_i64; 6];
+    for distance in distances.values() {
+        if *distance >= 1 && (*distance as usize) <= 5 {
+            frontier[*distance as usize] += 1;
+        }
+    }
+
+    let mut shrinking_layers = 0_i64;
+    let mut total_shrink = 0_i64;
+    for depth in 2..=5 {
+        if frontier[depth] > 0 && frontier[depth] < frontier[depth - 1] {
+            shrinking_layers += 1;
+            total_shrink += frontier[depth - 1] - frontier[depth];
+        } else if frontier[depth] == 0 && frontier[depth - 1] > 0 {
+            // The corridor dead-ends within the lookahead window.
+            shrinking_layers += 1;
+            total_shrink += frontier[depth - 1];
+        } else {
+            break;
+        }
+    }
+
+    if shrinking_layers < 2 {
+        return 0;
+    }
+
+    // Closer to the wall and more consecutive shrinking layers -> higher risk.
+    let edge_factor = (3 - edge).max(1);
+    shrinking_layers * shrinking_layers * edge_factor + total_shrink
 }
 
 /// Score the first few BFS layers so a wide room beats a long narrow tunnel.
@@ -3835,6 +4042,7 @@ mod tests {
             enemy_push_risk: 0,
             edge_exposure_risk: 0,
             commitment_risk: 0,
+            corridor_trend: 0,
             food_distance: Some(4),
             food_is_contested: false,
             food_viable: true,
@@ -4189,6 +4397,7 @@ mod tests {
             enemy_push_risk: 0,
             edge_exposure_risk: 0,
             commitment_risk: 0,
+            corridor_trend: 0,
             food_distance: None,
             food_is_contested: false,
             food_viable: false,
@@ -4305,6 +4514,7 @@ mod tests {
             enemy_push_risk: 2_700,
             edge_exposure_risk: 1_200,
             commitment_risk: 3_600,
+            corridor_trend: 0,
             food_distance: None,
             food_is_contested: false,
             food_viable: false,
@@ -4339,6 +4549,7 @@ mod tests {
             enemy_push_risk: 0,
             edge_exposure_risk: 0,
             commitment_risk: 0,
+            corridor_trend: 0,
             food_distance: None,
             food_is_contested: false,
             food_viable: false,
@@ -4382,6 +4593,7 @@ mod tests {
             enemy_push_risk: 2_900,
             edge_exposure_risk: 1_200,
             commitment_risk: 6_600,
+            corridor_trend: 0,
             food_distance: None,
             food_is_contested: false,
             food_viable: false,
@@ -4399,6 +4611,94 @@ mod tests {
 
         assert_eq!(preferred.len(), 1);
         assert_eq!(preferred[0].direction, Direction::Up);
+    }
+
+    #[test]
+    fn deep_safety_requires_two_escape_routes_near_boundary() {
+        let me = snake("me", 90, &[(1, 2), (1, 1), (1, 0)]);
+        let board = board(7, 7, &[], &[], vec![snake("me", 90, &[(1, 2), (1, 1), (1, 0)])]);
+        let root = Candidate {
+            direction: Direction::Left,
+            score: 0, health_after: 89, space: 20, exits: 3, eating: false,
+            territory: 10, forced_kill: false, future_survival: 10_000,
+            trap_risk: 0, enemy_pressure: 0, adversarial_space: 20,
+            future_space: 30, worst_case_space: 20, worst_case_exits: 3,
+            escape_routes: 2, future_worst_exits: 3, future_escape_routes: 2,
+            enemy_cutoff_risk: 0, enemy_push_risk: 0, edge_exposure_risk: 0,
+            commitment_risk: 0, corridor_trend: 0, food_distance: None,
+            food_is_contested: false, food_viable: false, loses_head_to_head: false,
+        };
+        let mut prediction = DeepPrediction {
+            score: 0, survival_plies: 6, min_exits: 3, min_escape_routes: 1,
+            min_space: 20, min_enemy_space: 20, min_enemy_exits: 3,
+            min_enemy_escape: 2, nodes: 0, timed_out: false,
+        };
+
+        assert!(!deep_candidate_is_safe(&prediction, &root, &me, &board, false, 6));
+        prediction.min_escape_routes = 2;
+        assert!(deep_candidate_is_safe(&prediction, &root, &me, &board, false, 6));
+    }
+
+    #[test]
+    fn deep_safety_keeps_one_escape_route_in_open_space() {
+        let me = snake("me", 90, &[(3, 3), (3, 2), (3, 1)]);
+        let board = board(9, 9, &[], &[], vec![snake("me", 90, &[(3, 3), (3, 2), (3, 1)])]);
+        let root = Candidate {
+            direction: Direction::Up,
+            score: 0, health_after: 89, space: 40, exits: 3, eating: false,
+            territory: 10, forced_kill: false, future_survival: 10_000,
+            trap_risk: 0, enemy_pressure: 0, adversarial_space: 40, future_space: 40,
+            worst_case_space: 40, worst_case_exits: 3, escape_routes: 1,
+            future_worst_exits: 3, future_escape_routes: 2, enemy_cutoff_risk: 0,
+            enemy_push_risk: 0, edge_exposure_risk: 0, commitment_risk: 0,
+            corridor_trend: 0, food_distance: None, food_is_contested: false,
+            food_viable: false, loses_head_to_head: false,
+        };
+        let prediction = DeepPrediction {
+            score: 0, survival_plies: 6, min_exits: 3, min_escape_routes: 1,
+            min_space: 40, min_enemy_space: 40, min_enemy_exits: 3,
+            min_enemy_escape: 2, nodes: 0, timed_out: false,
+        };
+
+        assert!(deep_candidate_is_safe(&prediction, &root, &me, &board, false, 6));
+    }
+
+    #[test]
+    fn anti_funnel_flags_a_shrinking_edge_corridor() {
+        let me = snake("me", 90, &[(1, 3), (1, 2), (1, 1)]);
+        let board = board(9, 9, &[], &[], vec![snake("me", 90, &[(1, 3), (1, 2), (1, 1)])]);
+        let candidate = Candidate {
+            direction: Direction::Left,
+            score: 0, health_after: 89, space: 18, exits: 2, eating: false,
+            territory: 10, forced_kill: false, future_survival: 10_000, trap_risk: 0,
+            enemy_pressure: 0, adversarial_space: 18, future_space: 8,
+            worst_case_space: 12, worst_case_exits: 2, escape_routes: 1,
+            future_worst_exits: 1, future_escape_routes: 1, enemy_cutoff_risk: 0,
+            enemy_push_risk: 0, edge_exposure_risk: 0, commitment_risk: 0,
+            corridor_trend: 8, food_distance: None, food_is_contested: false,
+            food_viable: false, loses_head_to_head: false,
+        };
+
+        assert!(is_anti_funnel_risk(&candidate, &me, &board, false));
+    }
+
+    #[test]
+    fn anti_funnel_does_not_flag_stable_open_space() {
+        let me = snake("me", 90, &[(4, 4), (4, 3), (4, 2)]);
+        let board = board(9, 9, &[], &[], vec![snake("me", 90, &[(4, 4), (4, 3), (4, 2)])]);
+        let candidate = Candidate {
+            direction: Direction::Up,
+            score: 0, health_after: 89, space: 40, exits: 3, eating: false,
+            territory: 10, forced_kill: false, future_survival: 10_000, trap_risk: 0,
+            enemy_pressure: 0, adversarial_space: 40, future_space: 41,
+            worst_case_space: 40, worst_case_exits: 3, escape_routes: 2,
+            future_worst_exits: 3, future_escape_routes: 2, enemy_cutoff_risk: 0,
+            enemy_push_risk: 0, edge_exposure_risk: 0, commitment_risk: 0,
+            corridor_trend: 0, food_distance: None, food_is_contested: false,
+            food_viable: false, loses_head_to_head: false,
+        };
+
+        assert!(!is_anti_funnel_risk(&candidate, &me, &board, false));
     }
 
     #[test]

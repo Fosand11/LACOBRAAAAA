@@ -16,8 +16,9 @@
 //! and deterministic so bad decisions remain reproducible from replays.
 
 use log::{debug, info, warn};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::time::{Duration, Instant};
 
@@ -69,12 +70,12 @@ const MIN_PREFERRED_FUTURE_SPACE: i64 = 100;
 // V2.2 anti-corner / anti-push analysis. These values are intentionally
 // strong: losing our last escape route is much worse than giving up some
 // territory or a nearby food pickup.
-const WORST_CASE_SPACE_WEIGHT: i64 = 28;
+const WORST_CASE_SPACE_WEIGHT: i64 = 120;
 const WORST_CASE_EXIT_WEIGHT: i64 = 1_150;
 const ESCAPE_ROUTE_WEIGHT: i64 = 240;
-const ENEMY_CUTOFF_WEIGHT: i64 = 18;
-const ENEMY_PUSH_WEIGHT: i64 = 14;
-const EDGE_EXPOSURE_WEIGHT: i64 = 11;
+const ENEMY_CUTOFF_WEIGHT: i64 = 40;
+const ENEMY_PUSH_WEIGHT: i64 = 30;
+const EDGE_EXPOSURE_WEIGHT: i64 = 25;
 const PUSH_DISTANCE_THRESHOLD: i64 = 8;
 
 // V2.3 strategic anti-cornering. We now look one enemy response and one
@@ -99,12 +100,12 @@ const MIN_FUTURE_ESCAPE_PREFERENCE: i64 = 1;
 // the deep engine now searches every root move at increasing depths and only
 // accepts a depth when all roots finished it. The last complete iteration is
 // always the result used for the move decision.
-const DEEP_PLY: usize = 12;
+const DEEP_PLY: usize = 16;
 const DEEP_BRANCH_WIDTH: usize = 3;
-const DEEP_MAX_NODES: u64 = 1_500_000;
+const DEEP_MAX_NODES: u64 = 4_000_000;
 const DEEP_MAX_TEST_NODES: u64 = 12_000_000;
-const DEEP_RESPONSE_RESERVE_MS: u128 = 65;
-const DEEP_ITER_DEPTHS: [usize; 5] = [4, 6, 8, 10, 12];
+const DEEP_RESPONSE_RESERVE_MS: u128 = 100;
+const DEEP_ITER_DEPTHS: [usize; 7] = [4, 6, 8, 10, 12, 14, 16];
 const DEEP_SAFE_MIN_EXITS: i64 = 2;
 const DEEP_SAFE_MIN_ESCAPE: i64 = 1;
 const DEEP_LOSS_SCORE: i64 = -1_000_000_000;
@@ -713,7 +714,7 @@ fn deep_select_direction(
     };
 
     let mut tt_tables: Vec<HashMap<DeepTTKey, DeepTTEntry>> =
-        (0..pool.len()).map(|_| HashMap::new()).collect();
+        (0..pool.len()).map(|_| HashMap::default()).collect();
     let mut completed_predictions: Vec<DeepPrediction> = Vec::new();
     let mut completed_depth = 0usize;
 
@@ -1126,7 +1127,7 @@ fn deep_prediction_for_candidate_with_limits_and_depth(
             max_nodes,
         };
         let enemy_context = stable_hash(enemy.id.as_bytes());
-        let mut tt = HashMap::new();
+        let mut tt = HashMap::default();
         let result = deep_minimax(
             game,
             board,
@@ -1621,7 +1622,7 @@ fn deep_nearest_food_distance(
         return None;
     }
 
-    let mut blocked = HashSet::new();
+    let mut blocked = HashSet::default();
     blocked.extend(state.our_body.iter().copied());
     blocked.extend(state.enemy_body.iter().copied());
     if let Some(tail) = state.our_body.last().copied() {
@@ -1709,11 +1710,17 @@ fn deep_quick_state_score(
 
     let food_pressure = deep_food_pressure(board, state, food, dangerous, wraps);
 
+    let distance_modifier = if state.our_body.len() > state.enemy_body.len() {
+        - (enemy_distance * 300) // Hunt smaller snakes
+    } else {
+        enemy_distance * 300 // Flee from larger or equal snakes
+    };
+
     exits * 18_000
         + escape * 16_000
         + edge * 700
         + state.our_health as i64 * 20
-        - enemy_distance * 300
+        + distance_modifier
         + offensive
         + food_pressure
         + if state.enemy_alive { 0 } else { 100_000 }
@@ -1729,7 +1736,7 @@ fn deep_quick_escape_metrics(
         return (0, 0);
     }
 
-    let mut blocked = HashSet::new();
+    let mut blocked = HashSet::default();
     blocked.extend(state.our_body.iter().copied());
     blocked.extend(state.enemy_body.iter().copied());
     if let Some(tail) = state.our_body.last().copied() {
@@ -1757,7 +1764,7 @@ fn deep_enemy_mobility(
         return (0, 0, 0);
     }
 
-    let mut blocked = HashSet::new();
+    let mut blocked = HashSet::default();
     blocked.extend(state.our_body.iter().copied());
     blocked.extend(state.enemy_body.iter().copied());
     if let Some(tail) = state.enemy_body.last().copied() {
@@ -1765,7 +1772,7 @@ fn deep_enemy_mobility(
     }
 
     let enemy_head = state.enemy_body[0];
-    let empty_danger = HashSet::new();
+    let empty_danger = HashSet::default();
     let exits = count_escape_exits(board, enemy_head, &blocked, &empty_danger, wraps) as i64;
     let escape = escape_routes_away_from_enemies(
         board,
@@ -1829,7 +1836,8 @@ fn deep_eval_state(
         + exits * 18_000
         + escape_routes * 16_000
         + edge * 700
-        + state.our_health as i64 * 25;
+        + state.our_health as i64 * 25
+        + food_pressure;
 
     if exits <= 1 {
         score -= 45_000;
@@ -1847,7 +1855,11 @@ fn deep_eval_state(
             board,
             wraps,
         );
-        score -= enemy_distance.saturating_sub(2) * 180;
+        if state.our_body.len() > state.enemy_body.len() {
+            score -= enemy_distance.saturating_sub(2) * 180;
+        } else {
+            score += enemy_distance * 180;
+        }
 
         // Offensive objective: once our own position is defensible, make the
         // enemy's world smaller. This turns the deep search into a predator
@@ -2223,7 +2235,7 @@ fn point_set(coords: &[Coord]) -> HashSet<Point> {
 }
 
 fn hazard_counts(hazards: &[Coord]) -> HashMap<Point, i32> {
-    let mut counts = HashMap::new();
+    let mut counts = HashMap::default();
     for hazard in hazards {
         *counts.entry(Point::from(hazard)).or_insert(0) += 1;
     }
@@ -2277,7 +2289,7 @@ fn blocked_after_move(
     projected_body: &[Point],
     grows: bool,
 ) -> (HashSet<Point>, bool) {
-    let mut blocked = HashSet::new();
+    let mut blocked = HashSet::default();
     for snake in &board.snakes {
         if snake.id != you.id {
             blocked.extend(snake.body.iter().map(Point::from));
@@ -2304,7 +2316,7 @@ fn larger_head_territory(
     my_length: i32,
     wraps: bool,
 ) -> HashSet<Point> {
-    let mut territory = HashSet::new();
+    let mut territory = HashSet::default();
     for snake in board.snakes.iter().filter(|snake| snake.id != you.id) {
         if snake_length(snake) < my_length {
             continue;
@@ -2341,7 +2353,7 @@ fn territory_analysis(
         blocked.extend(snake.body.iter().map(Point::from));
     }
 
-    let no_danger = HashSet::new();
+    let no_danger = HashSet::default();
     let (_, our_distances) = reachable_space(board, my_target, &blocked, &no_danger, wraps);
     let enemy_distances: Vec<(i32, HashMap<Point, i32>)> = board
         .snakes
@@ -2616,7 +2628,7 @@ fn reachable_space(
     dangerous: &HashSet<Point>,
     wraps: bool,
 ) -> (usize, HashMap<Point, i32>) {
-    let mut distances = HashMap::new();
+    let mut distances = HashMap::default();
     let mut queue = VecDeque::new();
     distances.insert(start, 0);
     queue.push_back(start);
@@ -2712,7 +2724,7 @@ fn enemy_pressure_score(
         let head = Point::from(&enemy.head);
         let neck = enemy.body.get(1).map(Point::from);
 
-        let mut blocked = HashSet::new();
+        let mut blocked = HashSet::default();
 
         // Block the enemy's own body except its head, plus every other snake.
         // This makes the BFS represent actual paths the enemy head can take.
@@ -2728,7 +2740,7 @@ fn enemy_pressure_score(
             blocked.remove(&neck);
         }
 
-        let (_, distances) = reachable_space(board, head, &blocked, &HashSet::new(), wraps);
+        let (_, distances) = reachable_space(board, head, &blocked, &HashSet::default(), wraps);
 
         let Some(&distance) = distances.get(&target) else {
             continue;
@@ -2827,7 +2839,7 @@ fn adversarial_escape_analysis(
         let mut enemy_max_commitment = 0_i64;
 
         for projected_enemy in enemy_moves {
-            let mut blocked = HashSet::new();
+            let mut blocked = HashSet::default();
             blocked.extend(projected_body.iter().copied());
 
             for snake in board.snakes.iter().filter(|snake| snake.id != you.id) {
@@ -3021,7 +3033,7 @@ fn best_escape_after_enemy(
             body.pop();
         }
 
-        let mut blocked = HashSet::new();
+        let mut blocked = HashSet::default();
         for snake in board.snakes.iter().filter(|snake| snake.id != you.id) {
             if snake.id == primary_enemy_id {
                 continue;
@@ -3569,6 +3581,7 @@ pub fn get_move(game: &Game, turn: &i32, board: &Board, you: &Battlesnake) -> Va
 
 #[cfg(test)]
 mod tests {
+    use std::iter::FromIterator;
     use super::*;
     use serde_json::json;
 
@@ -3591,7 +3604,7 @@ mod tests {
     }
 
     fn game(ruleset_name: &str, map: Option<&str>) -> Game {
-        let mut ruleset = HashMap::new();
+        let mut ruleset = std::collections::HashMap::new();
         ruleset.insert("name".to_owned(), Value::String(ruleset_name.to_owned()));
         ruleset.insert("settings".to_owned(), json!({ "hazardDamagePerTurn": 14 }));
         Game {
@@ -3880,14 +3893,14 @@ mod tests {
 
     #[test]
     fn nearest_food_prefers_uncontested_food_over_a_closer_contested_food() {
-        let food = HashSet::from([
+        let food = rustc_hash::FxHashSet::from_iter(vec![
             Point { x: 3, y: 2 },
             Point { x: 5, y: 2 },
         ]);
-        let mut our_distances = HashMap::new();
+        let mut our_distances = HashMap::default();
         our_distances.insert(Point { x: 3, y: 2 }, 1);
         our_distances.insert(Point { x: 5, y: 2 }, 3);
-        let mut enemy_path = HashMap::new();
+        let mut enemy_path = HashMap::default();
         enemy_path.insert(Point { x: 3, y: 2 }, 1);
         enemy_path.insert(Point { x: 5, y: 2 }, 99);
 
@@ -3914,7 +3927,7 @@ mod tests {
             vec![snake("me", 100, &[(2, 2), (2, 1)])],
         );
         let food = point_set(&board.food);
-        let mut distances = HashMap::new();
+        let mut distances = HashMap::default();
         distances.insert(Point { x: 4, y: 2 }, 1);
 
         let (distance, contested) = nearest_food(
@@ -3931,10 +3944,10 @@ mod tests {
 
     #[test]
     fn rejects_food_when_an_equal_enemy_has_the_same_real_path_length() {
-        let food = HashSet::from([Point { x: 4, y: 2 }]);
-        let mut our_distances = HashMap::new();
+        let food = rustc_hash::FxHashSet::from_iter(vec![Point { x: 4, y: 2 }]);
+        let mut our_distances = HashMap::default();
         our_distances.insert(Point { x: 4, y: 2 }, 1);
-        let mut enemy_path = HashMap::new();
+        let mut enemy_path = HashMap::default();
         enemy_path.insert(Point { x: 4, y: 2 }, 2);
 
         let (distance, contested) = nearest_food(
@@ -4136,7 +4149,7 @@ mod tests {
                 enemy_boxed,
             ],
         );
-        let dangerous = HashSet::new();
+        let dangerous = HashSet::default();
         let open_state = DeepState {
             our_body: me.body.iter().map(Point::from).collect(),
             our_health: 100,
@@ -4266,7 +4279,7 @@ mod tests {
         );
         let target = Point { x: 0, y: 2 };
         let projected = projected_body(&me, target, false);
-        let dangerous = HashSet::new();
+        let dangerous = HashSet::default();
         let hazards = hazard_counts(&board.hazards);
 
         let analysis = adversarial_escape_analysis(

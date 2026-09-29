@@ -318,22 +318,23 @@ fn food_route_score(
     food_is_contested: bool,
     eating: bool,
     constrictor: bool,
+    hunt_trigger: i32,
 ) -> i64 {
     if constrictor {
         return 0;
     }
 
     if eating {
-        return if health_after <= FOOD_HUNT_TRIGGER {
+        return if health_after <= hunt_trigger {
             FOOD_ROUTE_BONUS
-                + (FOOD_HUNT_TRIGGER - health_after).max(0) as i64
+                + (hunt_trigger - health_after).max(0) as i64
                     * FOOD_ROUTE_URGENCY_WEIGHT
         } else {
             0
         };
     }
 
-    if health_after > FOOD_HUNT_TRIGGER {
+    if health_after > hunt_trigger {
         return 0;
     }
 
@@ -347,7 +348,7 @@ fn food_route_score(
 
     let eta = distance.saturating_add(1);
     let margin = health_after - eta;
-    let urgency = (FOOD_HUNT_TRIGGER - health_after).max(0) as i64;
+    let urgency = (hunt_trigger - health_after).max(0) as i64;
     let contest_penalty = if food_is_contested { 30_000 } else { 0 };
 
     if margin >= FOOD_ROUTE_MARGIN {
@@ -512,7 +513,14 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
             pool = future_viable;
         }
 
-        let (food_pool, food_hunt_active) = prefer_food_routes(pool.clone(), you.health);
+        let max_enemy_length = board.snakes.iter()
+            .filter(|s| s.id != you.id)
+            .map(|s| snake_length(s))
+            .max()
+            .unwrap_or(0);
+        let effective_health = if snake_length(you) <= max_enemy_length { 0 } else { you.health };
+
+        let (food_pool, food_hunt_active) = prefer_food_routes(pool.clone(), effective_health);
         if food_hunt_active {
             pool = food_pool;
         }
@@ -1655,12 +1663,18 @@ fn deep_food_pressure(
         return 0;
     }
 
-    if state.our_health > FOOD_HUNT_TRIGGER {
+    let hunt_trigger = if state.our_body.len() <= state.enemy_body.len() {
+        100
+    } else {
+        FOOD_HUNT_TRIGGER
+    };
+
+    if state.our_health > hunt_trigger {
         return 0;
     }
 
     let distance = deep_nearest_food_distance(board, state, food, dangerous, wraps);
-    food_route_score(state.our_health, distance, false, false, false)
+    food_route_score(state.our_health, distance, false, false, false, hunt_trigger)
 }
 
 fn deep_quick_state_score(
@@ -1712,13 +1726,15 @@ fn deep_quick_state_score(
 
     let distance_modifier = if state.our_body.len() > state.enemy_body.len() {
         - (enemy_distance * 300) // Hunt smaller snakes
+    } else if state.our_body.len() < state.enemy_body.len() {
+        enemy_distance * 350 // Flee strictly larger snakes
     } else {
-        enemy_distance * 300 // Flee from larger or equal snakes
+        enemy_distance * 30 // Neutral/weak flee for equal snakes
     };
 
     exits * 18_000
         + escape * 16_000
-        + edge * 700
+        + edge * 1_200 + edge * edge * 80
         + state.our_health as i64 * 20
         + distance_modifier
         + offensive
@@ -1835,7 +1851,7 @@ fn deep_eval_state(
     let mut score = space as i64 * 320
         + exits * 18_000
         + escape_routes * 16_000
-        + edge * 700
+        + edge * 1_200 + edge * edge * 80
         + state.our_health as i64 * 25
         + food_pressure;
 
@@ -1857,8 +1873,10 @@ fn deep_eval_state(
         );
         if state.our_body.len() > state.enemy_body.len() {
             score -= enemy_distance.saturating_sub(2) * 180;
+        } else if state.our_body.len() < state.enemy_body.len() {
+            score += enemy_distance * 200;
         } else {
-            score += enemy_distance * 180;
+            score += enemy_distance * 20; // Weak flee when equal
         }
 
         // Offensive objective: once our own position is defensible, make the
@@ -2148,12 +2166,20 @@ fn evaluate_move(
         score += FORCED_KILL_BONUS;
     }
 
+    let max_enemy_length = board.snakes.iter()
+        .filter(|s| s.id != you.id)
+        .map(|s| snake_length(s))
+        .max()
+        .unwrap_or(0);
+    let hunt_trigger = if my_length <= max_enemy_length { 100 } else { FOOD_HUNT_TRIGGER };
+
     score += food_route_score(
         health_after,
         food_distance,
         food_is_contested,
         eating,
         constrictor,
+        hunt_trigger,
     );
 
     if eating
@@ -3104,13 +3130,13 @@ fn temporal_push_risk(
     let mut risk = current_push;
 
     if current_push > 0 && follow_distance <= current_distance && follow_edge <= current_edge {
-        risk += 900;
+        risk += 4_000;
     }
     if current_push > 0 && followup.exits <= 1 {
-        risk += 1_200;
+        risk += 8_000;
     }
     if current_push > 0 && followup.escape_routes == 0 {
-        risk += 900;
+        risk += 12_000;
     }
     risk
 }
@@ -3876,9 +3902,9 @@ mod tests {
 
     #[test]
     fn food_route_score_prefers_reachable_food_when_health_is_low() {
-        let near = food_route_score(30, Some(3), false, false, false);
-        let far = food_route_score(30, Some(12), false, false, false);
-        let no_food = food_route_score(30, None, false, false, false);
+        let near = food_route_score(30, Some(3), false, false, false, FOOD_HUNT_TRIGGER);
+        let far = food_route_score(30, Some(12), false, false, false, FOOD_HUNT_TRIGGER);
+        let no_food = food_route_score(30, None, false, false, false, FOOD_HUNT_TRIGGER);
 
         assert!(near > far);
         assert!(near > no_food);
@@ -3886,8 +3912,8 @@ mod tests {
 
     #[test]
     fn food_route_score_treats_late_food_as_a_survival_failure() {
-        let reachable = food_route_score(10, Some(2), false, false, false);
-        let late = food_route_score(10, Some(15), false, false, false);
+        let reachable = food_route_score(10, Some(2), false, false, false, FOOD_HUNT_TRIGGER);
+        let late = food_route_score(10, Some(15), false, false, false, FOOD_HUNT_TRIGGER);
 
         assert!(reachable > late);
         assert!(late < 0);

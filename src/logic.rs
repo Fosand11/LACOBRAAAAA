@@ -1686,7 +1686,7 @@ fn deep_quick_state_score(
     // V2.7: sustained squeeze ordering. During alpha-beta move ordering we want
     // our branches that preserve safety and compress enemy mobility to be searched
     // first. This materially improves pruning without adding another simulation.
-    let offensive = if state.enemy_alive && our_safe {
+    let offensive = if state.enemy_alive && our_safe && state.our_body.len() > state.enemy_body.len() {
         (board.width.max(0) as i64 * board.height.max(0) as i64 - enemy_space as i64).max(0)
             * DEEP_ENEMY_SPACE_WEIGHT
             + (4 - enemy_exits).max(0) * DEEP_ENEMY_EXIT_WEIGHT
@@ -1864,7 +1864,9 @@ fn deep_eval_state(
         // Offensive objective: once our own position is defensible, make the
         // enemy's world smaller. This turns the deep search into a predator
         // rather than a pure avoid-everything snake.
-        if exits >= 2 && escape_routes >= 1 {
+        // We ONLY do this if we are strictly larger, otherwise trying to squeeze
+        // a larger snake is suicide.
+        if exits >= 2 && escape_routes >= 1 && state.our_body.len() > state.enemy_body.len() {
             let board_area = board.width.max(0) as i64 * board.height.max(0) as i64;
             score += (board_area - enemy_space as i64).max(0) * DEEP_ENEMY_SPACE_WEIGHT;
             score += (4 - enemy_exits).max(0) * DEEP_ENEMY_EXIT_WEIGHT;

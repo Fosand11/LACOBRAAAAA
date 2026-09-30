@@ -73,9 +73,9 @@ const MIN_PREFERRED_FUTURE_SPACE: i64 = 100;
 const WORST_CASE_SPACE_WEIGHT: i64 = 120;
 const WORST_CASE_EXIT_WEIGHT: i64 = 1_150;
 const ESCAPE_ROUTE_WEIGHT: i64 = 240;
-const ENEMY_CUTOFF_WEIGHT: i64 = 40;
-const ENEMY_PUSH_WEIGHT: i64 = 30;
-const EDGE_EXPOSURE_WEIGHT: i64 = 25;
+const ENEMY_CUTOFF_WEIGHT: i64 = 80;
+const ENEMY_PUSH_WEIGHT: i64 = 65;
+const EDGE_EXPOSURE_WEIGHT: i64 = 45;
 const PUSH_DISTANCE_THRESHOLD: i64 = 8;
 
 // V2.3 strategic anti-cornering. We now look one enemy response and one
@@ -105,7 +105,7 @@ const DEEP_BRANCH_WIDTH: usize = 3;
 const DEEP_MAX_NODES: u64 = 4_000_000;
 const DEEP_MAX_TEST_NODES: u64 = 12_000_000;
 const DEEP_RESPONSE_RESERVE_MS: u128 = 100;
-const DEEP_ITER_DEPTHS: [usize; 7] = [4, 6, 8, 10, 12, 14, 16];
+const DEEP_ITER_DEPTHS: [usize; 8] = [2, 4, 6, 8, 10, 12, 14, 16];
 const DEEP_SAFE_MIN_EXITS: i64 = 2;
 const DEEP_SAFE_MIN_ESCAPE: i64 = 1;
 const DEEP_LOSS_SCORE: i64 = -1_000_000_000;
@@ -454,7 +454,7 @@ fn candidate_target_edge(candidate: &Candidate, you: &Battlesnake, board: &Board
 /// `Candidate` only contains moves that do not immediately leave the board,
 /// hit a body, or run out of health. A losing head-to-head is retained as a
 /// last resort, but is never selected when another survivable move exists.
-fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction {
+fn select_direction(game: &Game, board: &Board, you: &Battlesnake, started: Instant) -> Direction {
     let timeout_ms = u128::from(game.timeout);
     let wraps = is_wrapped(game);
 
@@ -518,7 +518,7 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
             .map(|s| snake_length(s))
             .max()
             .unwrap_or(0);
-        let effective_health = if snake_length(you) <= max_enemy_length { 0 } else { you.health };
+        let effective_health = if snake_length(you) <= max_enemy_length { FOOD_HUNT_TRIGGER } else { you.health };
 
         let (food_pool, food_hunt_active) = prefer_food_routes(pool.clone(), effective_health);
         if food_hunt_active {
@@ -568,7 +568,8 @@ fn select_direction(game: &Game, board: &Board, you: &Battlesnake) -> Direction 
 
     let reserve_ms = DEEP_RESPONSE_RESERVE_MS.min(timeout_ms.saturating_sub(20));
     let deep_budget_ms = timeout_ms.saturating_sub(reserve_ms).max(20);
-    let deep_deadline = Instant::now() + Duration::from_millis(deep_budget_ms as u64);
+    // Use the actual start time of the request to prevent timeouts
+    let deep_deadline = started + Duration::from_millis(deep_budget_ms as u64);
     deep_select_direction(game, board, you, pool, deep_deadline)
 }
 
@@ -813,16 +814,23 @@ fn deep_select_direction(
             && best.min_exits >= DEEP_SAFE_MIN_EXITS
             && best.min_escape_routes >= DEEP_SAFE_MIN_ESCAPE;
 
+        let max_enemy_len = board.snakes.iter()
+            .filter(|s| s.id != you.id)
+            .map(|s| snake_length(s))
+            .max()
+            .unwrap_or(0);
+        let effective_hunt_trigger = if snake_length(you) <= max_enemy_len { 100 } else { FOOD_HUNT_TRIGGER };
+
         let candidate_food = if safe_food_candidate(pool[index]) {
             2
-        } else if you.health <= FOOD_HUNT_TRIGGER && pool[index].food_viable && !pool[index].food_is_contested {
+        } else if you.health <= effective_hunt_trigger && pool[index].food_viable && !pool[index].food_is_contested {
             1
         } else {
             0
         };
         let best_food = if safe_food_candidate(pool[best_index]) {
             2
-        } else if you.health <= FOOD_HUNT_TRIGGER && pool[best_index].food_viable && !pool[best_index].food_is_contested {
+        } else if you.health <= effective_hunt_trigger && pool[best_index].food_viable && !pool[best_index].food_is_contested {
             1
         } else {
             0
@@ -1260,7 +1268,19 @@ fn deep_minimax(
     control.nodes += 1;
     if control.nodes >= control.max_nodes || Instant::now() >= control.deadline {
         control.timed_out = true;
-        return deep_eval_state(board, state, food, static_blocked, dangerous, wraps, depth_from_root, baseline_enemy_space, baseline_enemy_exits, baseline_enemy_escape);
+        // On timeout, the result will be discarded by the iterative deepening loop.
+        // Return a dummy evaluation immediately to avoid wasting 10-20ms per unwound leaf
+        // running BFS in deep_eval_state.
+        return DeepEval {
+            score: 0,
+            survival_plies: 0,
+            min_exits: 0,
+            min_escape_routes: 0,
+            min_space: 0,
+            min_enemy_space: 0,
+            min_enemy_exits: 0,
+            min_enemy_escape: 0,
+        };
     }
 
     let tt_key = DeepTTKey {
@@ -1351,12 +1371,11 @@ fn deep_minimax(
     }
 
     let mut ranked = states;
-    ranked.sort_unstable_by(|a, b| {
-        let a_score = deep_quick_state_score(board, a, food, dangerous, wraps, baseline_enemy_space, baseline_enemy_exits, baseline_enemy_escape);
-        let b_score = deep_quick_state_score(board, b, food, dangerous, wraps, baseline_enemy_space, baseline_enemy_exits, baseline_enemy_escape);
+    ranked.sort_by_cached_key(|state| {
+        let score = deep_quick_state_score(board, state, food, dangerous, wraps, baseline_enemy_space, baseline_enemy_exits, baseline_enemy_escape);
         match actor {
-            DeepActor::OurSnake => b_score.cmp(&a_score),
-            DeepActor::Enemy => a_score.cmp(&b_score),
+            DeepActor::OurSnake => -score,
+            DeepActor::Enemy => score,
         }
     });
     // V2.7: `ranked` is already ordered by deep_quick_state_score.
@@ -2016,7 +2035,10 @@ fn evaluate_move(
         }
     }
     if traversable_tail {
-        if let Some(tail) = you.body.last().map(Point::from) {
+        // The tail that will vacate on the NEXT turn is the last segment of
+        // projected_body (our body after this move), not you.body.last()
+        // which was already popped during projection.
+        if let Some(tail) = projected_body.last().copied() {
             planning_blocked.remove(&tail);
         }
     }
@@ -2122,10 +2144,26 @@ fn evaluate_move(
 
     if !wraps {
         let edge = boundary_distance(target, board);
+
+        // When an enemy head is close AND we are near the wall, this is exactly
+        // the setup for a walling trap. Penalise much more aggressively.
+        let nearest_enemy_dist = board.snakes.iter()
+            .filter(|s| s.id != you.id)
+            .map(|s| topology_distance(target, Point::from(&s.head), board, wraps))
+            .min()
+            .unwrap_or(99);
+
+        let enemy_wall_threat = if edge <= 1 && nearest_enemy_dist <= 4 {
+            let proximity = (5 - nearest_enemy_dist).max(1);
+            proximity * 3_500
+        } else {
+            0
+        };
+
         if edge == 0 && exits <= 2 {
-            score -= EDGE_ZERO_PENALTY;
+            score -= EDGE_ZERO_PENALTY + enemy_wall_threat;
         } else if edge == 1 && exits <= 2 {
-            score -= EDGE_COMMITMENT_PENALTY;
+            score -= EDGE_COMMITMENT_PENALTY + enemy_wall_threat;
         } else if edge >= INTERIOR_PREFERENCE_MIN_EDGE {
             score += EDGE_RECOVERY_BONUS;
         }
@@ -2776,8 +2814,13 @@ fn enemy_pressure_score(
 
         if distance <= PRESSURE_DISTANCE {
             let proximity = (PRESSURE_DISTANCE - distance + 1) as i64;
-            let size_factor = if snake_length(enemy) >= snake_length(you) {
-                3
+            
+            // If the enemy is larger, moving to a square 1 or 2 steps from their head
+            // allows them to threaten a head-to-head collision on the next turn.
+            let size_factor = if snake_length(enemy) > snake_length(you) {
+                if distance <= 2 { 3_000 } else { 15 }
+            } else if snake_length(enemy) == snake_length(you) {
+                if distance <= 2 { 250 } else { 5 }
             } else {
                 1
             };
@@ -3154,39 +3197,39 @@ fn commitment_risk_score(
     let mut risk = 0_i64;
 
     if followup.exits <= 1 {
-        risk += 2_000;
+        risk += 6_000;
     } else if followup.exits == 2 {
-        risk += 500;
+        risk += 1_500;
     }
 
     if followup.escape_routes == 0 {
-        risk += 1_400;
+        risk += 5_000;
     } else if followup.escape_routes == 1 {
-        risk += 500;
+        risk += 1_200;
     }
 
     if escape_routes <= 0 {
-        risk += 800;
+        risk += 3_000;
     } else if escape_routes == 1 {
-        risk += 250;
+        risk += 800;
     }
 
     if push >= ENEMY_PUSH_DANGER {
-        risk += 1_000;
+        risk += 3_000;
     }
     if push >= ENEMY_PUSH_DANGER && followup.exits <= 2 {
-        risk += 1_200;
+        risk += 4_000;
     }
     if push >= ENEMY_PUSH_DANGER && followup.escape_routes <= 1 {
-        risk += 900;
+        risk += 3_000;
     }
 
     if !wraps && edge <= 1 {
         if exits <= 2 {
-            risk += 700;
+            risk += 2_500;
         }
         if followup.boundary_distance <= edge {
-            risk += 650;
+            risk += 2_000;
         }
     }
 
@@ -3372,16 +3415,16 @@ fn enemy_push_risk(
     if distance <= PUSH_DISTANCE_THRESHOLD {
         let proximity = (PUSH_DISTANCE_THRESHOLD - distance + 1).max(1);
         if escape_routes == 0 {
-            risk += proximity * 180;
+            risk += proximity * 500;
         } else if escape_routes == 1 {
-            risk += proximity * 55;
+            risk += proximity * 180;
         }
     }
 
     if exits <= 1 {
-        risk += 1_200;
+        risk += 4_000;
     } else if exits == 2 && escape_routes == 0 {
-        risk += 550;
+        risk += 2_000;
     }
 
     let interior_escape = DIRECTIONS
@@ -3392,7 +3435,7 @@ fn enemy_push_risk(
         .count() as i64;
 
     if boundary_distance(target, board) <= 1 && exits <= 2 && interior_escape == 0 {
-        risk += 850;
+        risk += 3_500;
     }
 
     risk
@@ -3534,10 +3577,11 @@ fn nearest_food(
 }
 
 fn centre_score(point: Point, board: &Board) -> i64 {
-    // Prefer the centre only as a tie-breaker; usable space dominates this.
     let horizontal = (2 * point.x - (board.width - 1)).abs();
     let vertical = (2 * point.y - (board.height - 1)).abs();
-    -(horizontal + vertical) as i64 * 8
+    let manhattan = (horizontal + vertical) as i64;
+    // Quadratic penalty: being far from centre gets exponentially worse.
+    -(manhattan * 120 + manhattan * manhattan * 30)
 }
 
 fn ruleset_name(game: &Game) -> &str {
@@ -3571,7 +3615,7 @@ fn hazard_damage(game: &Game) -> i32 {
 // move is called on every turn and returns the next move.
 pub fn get_move(game: &Game, turn: &i32, board: &Board, you: &Battlesnake) -> Value {
     let started = Instant::now();
-    let chosen = select_direction(game, board, you);
+    let chosen = select_direction(game, board, you, started);
     let elapsed_ms = started.elapsed().as_millis();
     let warning_threshold_ms = u128::from(game.timeout) * 3 / 4;
     let target = chosen
@@ -3670,7 +3714,7 @@ mod tests {
             vec![snake("me", 100, &[(0, 1), (1, 1), (2, 1)])],
         );
 
-        let direction = select_direction(&game("standard", None), &board, &me);
+        let direction = select_direction(&game("standard", None), &board, &me, std::time::Instant::now());
 
         assert!(matches!(direction, Direction::Up | Direction::Down));
     }
@@ -3688,7 +3732,7 @@ mod tests {
         );
 
         assert_ne!(
-            select_direction(&game("standard", None), &board, &me),
+            select_direction(&game("standard", None), &board, &me, std::time::Instant::now()),
             Direction::Right
         );
     }
@@ -3705,7 +3749,7 @@ mod tests {
         );
 
         assert_ne!(
-            select_direction(&game("standard", None), &board, &me),
+            select_direction(&game("standard", None), &board, &me, std::time::Instant::now()),
             Direction::Down
         );
     }
@@ -3722,7 +3766,7 @@ mod tests {
         );
 
         assert_eq!(
-            select_direction(&game("standard", None), &board, &me),
+            select_direction(&game("standard", None), &board, &me, std::time::Instant::now()),
             Direction::Right
         );
     }
@@ -3739,7 +3783,7 @@ mod tests {
         );
 
         assert_eq!(
-            select_direction(&game("standard", None), &board, &me),
+            select_direction(&game("standard", None), &board, &me, std::time::Instant::now()),
             Direction::Right
         );
     }
@@ -3757,7 +3801,7 @@ mod tests {
         );
 
         assert_eq!(
-            select_direction(&game("standard", None), &board, &me),
+            select_direction(&game("standard", None), &board, &me, std::time::Instant::now()),
             Direction::Left
         );
     }
@@ -3774,7 +3818,7 @@ mod tests {
         );
 
         assert_eq!(
-            select_direction(&game("standard", None), &board, &me),
+            select_direction(&game("standard", None), &board, &me, std::time::Instant::now()),
             Direction::Right
         );
     }
@@ -3791,7 +3835,7 @@ mod tests {
         );
 
         assert_ne!(
-            select_direction(&game("standard", None), &board, &me),
+            select_direction(&game("standard", None), &board, &me, std::time::Instant::now()),
             Direction::Right
         );
     }
@@ -3811,7 +3855,7 @@ mod tests {
         );
 
         assert_eq!(
-            select_direction(&game("standard", Some("wrapped")), &board, &me),
+            select_direction(&game("standard", Some("wrapped")), &board, &me, std::time::Instant::now()),
             Direction::Left
         );
     }
@@ -3829,7 +3873,7 @@ mod tests {
         );
 
         assert_ne!(
-            select_direction(&game("constrictor", None), &board, &me),
+            select_direction(&game("constrictor", None), &board, &me, std::time::Instant::now()),
             Direction::Left
         );
     }
@@ -4047,7 +4091,7 @@ mod tests {
         );
 
         assert_eq!(
-            select_direction(&game("standard", None), &board, &me),
+            select_direction(&game("standard", None), &board, &me, std::time::Instant::now()),
             Direction::Down
         );
     }
@@ -4283,7 +4327,7 @@ mod tests {
             ],
         );
 
-        let chosen = select_direction(&game("standard", None), &board, &me);
+        let chosen = select_direction(&game("standard", None), &board, &me, std::time::Instant::now());
         assert_ne!(chosen, Direction::Right);
     }
 
@@ -4523,7 +4567,7 @@ mod tests {
         );
 
         assert_eq!(
-            select_direction(&game("standard", None), &board, &me),
+            select_direction(&game("standard", None), &board, &me, std::time::Instant::now()),
             Direction::Up
         );
     }
@@ -4540,7 +4584,7 @@ mod tests {
         );
 
         assert_eq!(
-            select_direction(&game("standard", None), &board, &me),
+            select_direction(&game("standard", None), &board, &me, std::time::Instant::now()),
             Direction::Right
         );
     }
